@@ -1,6 +1,6 @@
 [project]
 name = "by-framework-history-postgres"
-version = "0.2.0"
+version = "0.0.1"
 description = "PostgreSQL history backend for by-framework"
 readme = "README.md"
 requires-python = ">=3.12"

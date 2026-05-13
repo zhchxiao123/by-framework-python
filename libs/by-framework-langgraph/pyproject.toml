@@ -1,6 +1,6 @@
 [project]
 name = "by-framework-langgraph"
-version = "0.2.0"
+version = "0.0.1"
 description = "LangGraph integration for by-framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -20,10 +20,10 @@ dev = [
     "ruff>=0.3.0",
 ]
 langfuse = [
-    "by-framework-trace-langfuse>=0.2.0",
+    "by-framework-trace-langfuse>=0.0.1",
 ]
 phoenix = [
-    "by-framework-trace-phoenix>=0.2.0",
+    "by-framework-trace-phoenix>=0.0.1",
     "openinference-instrumentation-langchain>=0.1.0",
     "openinference-instrumentation-openai>=0.1.0",
 ]

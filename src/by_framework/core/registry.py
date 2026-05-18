@@ -469,6 +469,103 @@ class WorkerRegistry:
         """Delete a persisted AgentConfigsSnapshot blob."""
         await self.redis.delete(RedisKeys.agent_configs_snapshot(snapshot_key))
 
+    def _build_worker_execution_snapshot(
+        self, execution: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build a compact worker-facing execution snapshot."""
+        return {
+            "execution_id": execution.get("execution_id", ""),
+            "message_id": execution.get("message_id", ""),
+            "session_id": execution.get("session_id", ""),
+            "worker_id": execution.get("worker_id", ""),
+            "target_agent_type": execution.get("target_agent_type", ""),
+            "status": execution.get("status", ""),
+            "created_at": int(execution.get("created_at", 0) or 0),
+            "started_at": int(execution.get("started_at", 0) or 0),
+            "finished_at": int(execution.get("finished_at", 0) or 0),
+            "updated_at": int(execution.get("updated_at", 0) or 0),
+            "parent_message_id": execution.get("parent_message_id", ""),
+            "cancel_requested": bool(execution.get("cancel_requested", False)),
+            "cancel_reason": execution.get("cancel_reason", ""),
+        }
+
+    @staticmethod
+    def _status_count_field(status: str) -> str:
+        return f"{status.lower()}_count"
+
+    async def _update_worker_execution_stats(
+        self,
+        old_execution: Optional[dict[str, Any]],
+        new_execution: dict[str, Any],
+        now: int,
+    ) -> None:
+        """Incrementally update worker-level aggregate stats and snapshots."""
+        worker_id = str(new_execution.get("worker_id") or "")
+        if not worker_id:
+            return
+
+        old_worker_id = str((old_execution or {}).get("worker_id") or "")
+        old_status = str((old_execution or {}).get("status") or "")
+        new_status = str(new_execution.get("status") or "")
+        execution_id = str(new_execution["execution_id"])
+
+        first_seen_by_worker = old_worker_id != worker_id
+        old_active = bool(
+            old_worker_id == worker_id and not is_terminal_state(old_status)
+        )
+        new_active = not is_terminal_state(new_status)
+
+        status_key = RedisKeys.worker_status(worker_id)
+        history_key = RedisKeys.worker_executions(worker_id)
+        active_key = RedisKeys.worker_active_execution_index(worker_id)
+        active_snapshots_key = RedisKeys.worker_active_snapshots(worker_id)
+        history_snapshots_key = RedisKeys.worker_history_snapshots(worker_id)
+        snapshot = json.dumps(
+            self._build_worker_execution_snapshot(new_execution), ensure_ascii=False
+        )
+
+        pipe = self.redis.pipeline()
+        if first_seen_by_worker:
+            pipe.hincrby(status_key, "total_count", 1)
+        if first_seen_by_worker or old_status != new_status:
+            if old_status and old_worker_id == worker_id:
+                pipe.hincrby(status_key, self._status_count_field(old_status), -1)
+            if new_status:
+                pipe.hincrby(status_key, self._status_count_field(new_status), 1)
+        if not old_active and new_active:
+            pipe.hincrby(status_key, "active_count", 1)
+        elif old_active and not new_active:
+            pipe.hincrby(status_key, "active_count", -1)
+
+        pipe.hset(status_key, "last_updated_at", now)
+        if new_status == "RUNNING":
+            pipe.hset(
+                status_key,
+                "last_started_at",
+                int(new_execution.get("started_at", 0) or 0),
+            )
+        if is_terminal_state(new_status):
+            pipe.hset(
+                status_key,
+                "last_finished_at",
+                int(new_execution.get("finished_at", 0) or 0),
+            )
+
+        pipe.zadd(history_key, {execution_id: now})
+        pipe.hset(history_snapshots_key, execution_id, snapshot)
+        if new_active:
+            pipe.zadd(active_key, {execution_id: now})
+            pipe.hset(active_snapshots_key, execution_id, snapshot)
+        else:
+            pipe.zrem(active_key, execution_id)
+            pipe.hdel(active_snapshots_key, execution_id)
+        pipe.expire(status_key, RedisKeys.DEFAULT_SESSION_TTL)
+        pipe.expire(history_key, RedisKeys.DEFAULT_SESSION_TTL)
+        pipe.expire(active_key, RedisKeys.DEFAULT_SESSION_TTL)
+        pipe.expire(active_snapshots_key, RedisKeys.DEFAULT_SESSION_TTL)
+        pipe.expire(history_snapshots_key, RedisKeys.DEFAULT_SESSION_TTL)
+        await pipe.execute()
+
     async def update_execution_status(
         self, execution_id: str, session_id: str, status: str, **kwargs
     ):
@@ -477,6 +574,7 @@ class WorkerRegistry:
         if current is None:
             return
 
+        old_execution = dict(current)
         now = int(time.time() * 1000)
         current["status"] = status
         current["updated_at"] = now
@@ -499,6 +597,7 @@ class WorkerRegistry:
         )
         pipe.expire(reg_key, RedisKeys.DEFAULT_SESSION_TTL)
         await pipe.execute()
+        await self._update_worker_execution_stats(old_execution, current, now)
 
     async def update_execution_status_by_message(
         self, message_id: str, session_id: str, status: str
@@ -555,6 +654,7 @@ class WorkerRegistry:
         execution_id = execution["execution_id"]
         message_id = execution["message_id"]
         session_id = execution["session_id"]
+        old_execution = await self.get_execution(execution_id, session_id)
 
         reg_key = RedisKeys.session_registry(session_id)
         encoded_data = json.dumps(execution, ensure_ascii=False)
@@ -565,6 +665,7 @@ class WorkerRegistry:
         pipe.hset(reg_key, f"{MSG_MAP_PREFIX}{message_id}", execution_id)
         pipe.expire(reg_key, RedisKeys.DEFAULT_SESSION_TTL)
         await pipe.execute()
+        await self._update_worker_execution_stats(old_execution, execution, now)
 
     async def get_execution(
         self, execution_id: str, session_id: str = ""
@@ -632,6 +733,7 @@ class WorkerRegistry:
         if current is None:
             return
 
+        old_execution = dict(current)
         current["status"] = "CANCELLING"
         current["cancel_requested"] = True
         current["cancel_reason"] = reason
@@ -651,6 +753,7 @@ class WorkerRegistry:
         )
         pipe.expire(reg_key, RedisKeys.DEFAULT_SESSION_TTL)
         await pipe.execute()
+        await self._update_worker_execution_stats(old_execution, current, now)
 
     async def mark_cancel_requested(
         self, execution_id: str, session_id: str, reason: str = ""
@@ -670,6 +773,7 @@ class WorkerRegistry:
         if current is None:
             return
 
+        old_execution = dict(current)
         current["cancel_requested"] = True
         if reason:
             current["cancel_reason"] = reason
@@ -684,6 +788,9 @@ class WorkerRegistry:
         )
         pipe.expire(reg_key, RedisKeys.DEFAULT_SESSION_TTL)
         await pipe.execute()
+        await self._update_worker_execution_stats(
+            old_execution, current, current["updated_at"]
+        )
 
     async def mark_execution_finished(
         self, execution_id: str, session_id: str, status: str
@@ -699,6 +806,7 @@ class WorkerRegistry:
         if current is None:
             return
 
+        old_execution = dict(current)
         current["status"] = status
         now = int(time.time() * 1000)
         current["finished_at"] = now
@@ -717,6 +825,7 @@ class WorkerRegistry:
         )
         pipe.expire(reg_key, RedisKeys.DEFAULT_SESSION_TTL)
         await pipe.execute()
+        await self._update_worker_execution_stats(old_execution, current, now)
 
         snapshot_key = current.get("agent_configs_snapshot_key", "")
         if snapshot_key and is_terminal_state(status):
@@ -774,6 +883,138 @@ class WorkerRegistry:
             except json.JSONDecodeError:
                 continue
         return executions
+
+    async def get_worker_executions(
+        self,
+        worker_id: str,
+        *,
+        include_terminal: bool = True,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Get recent lightweight execution snapshots assigned to a Worker."""
+        if limit <= 0:
+            return []
+
+        execution_ids = await self.redis.zrevrange(
+            RedisKeys.worker_executions(worker_id), 0, limit - 1
+        )
+        return await self._get_worker_snapshots(
+            RedisKeys.worker_history_snapshots(worker_id),
+            execution_ids,
+            include_terminal=include_terminal,
+        )
+
+    async def _get_worker_snapshots(
+        self,
+        snapshots_key: str,
+        raw_execution_ids: list[Any],
+        *,
+        include_terminal: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Fetch worker execution snapshots in batch and preserve ID order."""
+        execution_ids = [
+            raw_execution_id.decode("utf-8")
+            if isinstance(raw_execution_id, bytes)
+            else str(raw_execution_id)
+            for raw_execution_id in raw_execution_ids
+        ]
+        if not execution_ids:
+            return []
+
+        raw_snapshots = await self.redis.hmget(snapshots_key, execution_ids)
+        snapshots: list[dict[str, Any]] = []
+        for raw_snapshot in raw_snapshots:
+            if not raw_snapshot:
+                continue
+            snapshot_data = (
+                raw_snapshot.decode("utf-8")
+                if isinstance(raw_snapshot, bytes)
+                else str(raw_snapshot)
+            )
+            try:
+                snapshot = json.loads(snapshot_data)
+            except json.JSONDecodeError:
+                continue
+            status = str(snapshot.get("status") or "")
+            if not include_terminal and is_terminal_state(status):
+                continue
+            snapshots.append(snapshot)
+
+        return snapshots
+
+    @staticmethod
+    def _get_int_hash_value(data: dict[Any, Any], key: str) -> int:
+        value = data.get(key)
+        if value is None:
+            value = data.get(key.encode("utf-8"))
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        return int(value or 0)
+
+    async def get_worker_execution_summary(
+        self,
+        worker_id: str,
+        *,
+        active_limit: int = 100,
+        history_limit: int = 20,
+        limit: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Get worker liveness metadata and recent execution state summary."""
+        if limit is not None:
+            history_limit = limit
+
+        workers = await self.get_all_workers()
+        worker_info = workers.get(worker_id, {})
+        raw_counts = await self.redis.hgetall(RedisKeys.worker_status(worker_id))
+        counts = {
+            "total": self._get_int_hash_value(raw_counts, "total_count"),
+            "active": self._get_int_hash_value(raw_counts, "active_count"),
+            "queued": self._get_int_hash_value(raw_counts, "queued_count"),
+            "running": self._get_int_hash_value(raw_counts, "running_count"),
+            "cancelling": self._get_int_hash_value(raw_counts, "cancelling_count"),
+            "completed": self._get_int_hash_value(raw_counts, "completed_count"),
+            "failed": self._get_int_hash_value(raw_counts, "failed_count"),
+            "cancelled": self._get_int_hash_value(raw_counts, "cancelled_count"),
+        }
+
+        active_executions = []
+        if active_limit > 0:
+            active_ids = await self.redis.zrevrange(
+                RedisKeys.worker_active_execution_index(worker_id), 0, active_limit - 1
+            )
+            active_executions = await self._get_worker_snapshots(
+                RedisKeys.worker_active_snapshots(worker_id), active_ids
+            )
+        recent_executions = await self.get_worker_executions(
+            worker_id, limit=history_limit
+        )
+        status_counts = {
+            "QUEUED": counts["queued"],
+            "RUNNING": counts["running"],
+            "CANCELLING": counts["cancelling"],
+            "COMPLETED": counts["completed"],
+            "FAILED": counts["failed"],
+            "CANCELLED": counts["cancelled"],
+        }
+        status_counts = {key: value for key, value in status_counts.items() if value}
+
+        return {
+            "worker_id": worker_id,
+            "online": worker_id in workers,
+            "agent_types": sorted(worker_info.get("agent_types", [])),
+            "last_seen": int(worker_info.get("last_seen", 0)),
+            "counts": counts,
+            "active_count": counts["active"],
+            "total_tracked": counts["total"],
+            "last_updated_at": self._get_int_hash_value(raw_counts, "last_updated_at"),
+            "last_started_at": self._get_int_hash_value(raw_counts, "last_started_at"),
+            "last_finished_at": self._get_int_hash_value(
+                raw_counts, "last_finished_at"
+            ),
+            "status_counts": status_counts,
+            "active_executions": active_executions,
+            "recent_executions": recent_executions,
+        }
 
     def _encode_execution(self, execution: dict[str, Any]) -> dict[str, str]:  # pylint: disable=unused-argument
         # Deprecated, since we switched to JSON storage

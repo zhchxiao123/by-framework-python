@@ -76,6 +76,36 @@ class RedisKeys:
         return f"byai_gateway:registry:worker:online:{worker_id}"
 
     @staticmethod
+    def worker_status(worker_id: str) -> str:
+        """HASH storing aggregate execution counters for a Worker."""
+        return f"byai_gateway:registry:worker:status:{worker_id}"
+
+    @staticmethod
+    def worker_executions(worker_id: str) -> str:
+        """ZSET of execution IDs handled by a Worker, scored by update time."""
+        return f"byai_gateway:registry:worker:executions:{worker_id}"
+
+    @staticmethod
+    def worker_active_executions(worker_id: str) -> str:
+        """Legacy SET of non-terminal execution IDs assigned to a Worker."""
+        return f"byai_gateway:registry:worker:active_executions:{worker_id}"
+
+    @staticmethod
+    def worker_active_execution_index(worker_id: str) -> str:
+        """ZSET of active execution IDs assigned to a Worker, scored by update time."""
+        return f"byai_gateway:registry:worker:active_execution_index:{worker_id}"
+
+    @staticmethod
+    def worker_active_snapshots(worker_id: str) -> str:
+        """HASH mapping active execution IDs to lightweight snapshots."""
+        return f"byai_gateway:registry:worker:active_snapshots:{worker_id}"
+
+    @staticmethod
+    def worker_history_snapshots(worker_id: str) -> str:
+        """HASH mapping worker execution IDs to lightweight history snapshots."""
+        return f"byai_gateway:registry:worker:history_snapshots:{worker_id}"
+
+    @staticmethod
     def session_registry(session_id: str) -> str:
         """Session-level aggregate registry (Hash).
 

@@ -10,6 +10,28 @@ from by_framework import AgentConfig, PluginRegistry, RedisKeys, WorkerRegistry
 OLD_ACTIVE_WORKERS = "byai_gateway:registry:active_workers"
 
 
+def test_worker_execution_key_builders():
+    """Test worker execution key builders."""
+    assert RedisKeys.worker_status("worker-1") == (
+        "byai_gateway:registry:worker:status:worker-1"
+    )
+    assert RedisKeys.worker_executions("worker-1") == (
+        "byai_gateway:registry:worker:executions:worker-1"
+    )
+    assert RedisKeys.worker_active_executions("worker-1") == (
+        "byai_gateway:registry:worker:active_executions:worker-1"
+    )
+    assert RedisKeys.worker_active_execution_index("worker-1") == (
+        "byai_gateway:registry:worker:active_execution_index:worker-1"
+    )
+    assert RedisKeys.worker_active_snapshots("worker-1") == (
+        "byai_gateway:registry:worker:active_snapshots:worker-1"
+    )
+    assert RedisKeys.worker_history_snapshots("worker-1") == (
+        "byai_gateway:registry:worker:history_snapshots:worker-1"
+    )
+
+
 class MockPipeline:
     """Mock Redis pipeline for testing."""
 
@@ -21,6 +43,30 @@ class MockPipeline:
         self.commands.append(("hset", name, key, value))
         return self
 
+    def hdel(self, name, *keys):
+        self.commands.append(("hdel", name, keys))
+        return self
+
+    def sadd(self, name, value):
+        self.commands.append(("sadd", name, value))
+        return self
+
+    def srem(self, name, value):
+        self.commands.append(("srem", name, value))
+        return self
+
+    def zadd(self, name, mapping):
+        self.commands.append(("zadd", name, mapping))
+        return self
+
+    def zrem(self, name, *values):
+        self.commands.append(("zrem", name, values))
+        return self
+
+    def hincrby(self, name, key, amount=1):
+        self.commands.append(("hincrby", name, key, amount))
+        return self
+
     def expire(self, name, ttl):
         self.commands.append(("expire", name, ttl))
         return self
@@ -29,6 +75,18 @@ class MockPipeline:
         for cmd in self.commands:
             if cmd[0] == "hset":
                 await self.redis.hset(cmd[1], {cmd[2]: cmd[3]})
+            elif cmd[0] == "hdel":
+                await self.redis.hdel(cmd[1], *cmd[2])
+            elif cmd[0] == "sadd":
+                await self.redis.sadd(cmd[1], cmd[2])
+            elif cmd[0] == "srem":
+                await self.redis.srem(cmd[1], cmd[2])
+            elif cmd[0] == "zadd":
+                await self.redis.zadd(cmd[1], cmd[2])
+            elif cmd[0] == "zrem":
+                await self.redis.zrem(cmd[1], *cmd[2])
+            elif cmd[0] == "hincrby":
+                await self.redis.hincrby(cmd[1], cmd[2], cmd[3])
             elif cmd[0] == "expire":
                 await self.redis.expire(cmd[1], cmd[2])
         return []
@@ -69,6 +127,19 @@ class MockRedis:
             if min_score <= v <= max_val:
                 result.append((k, v) if withscores else k)
         return result
+
+    async def zrevrange(self, name, start, end):
+        if name not in self.data:
+            return []
+        items = sorted(self.data[name].items(), key=lambda item: item[1], reverse=True)
+        if end == -1:
+            selected = items[start:]
+        else:
+            selected = items[start : end + 1]
+        return [item[0] for item in selected]
+
+    async def zcard(self, name):
+        return len(self.data.get(name, {}))
 
     async def sadd(self, name, value):
         if name not in self.data:
@@ -121,6 +192,28 @@ class MockRedis:
 
     async def hgetall(self, name):
         return self.data.get(name, {})
+
+    async def hmget(self, name, keys):
+        bucket = self.data.get(name, {})
+        return [bucket.get(key) for key in keys]
+
+    async def hincrby(self, name, key, amount=1):
+        if name not in self.data:
+            self.data[name] = {}
+        value = int(self.data[name].get(key, 0)) + amount
+        self.data[name][key] = value
+        return value
+
+    async def hdel(self, name, *keys):
+        bucket = self.data.get(name)
+        if not isinstance(bucket, dict):
+            return 0
+        removed = 0
+        for key in keys:
+            if key in bucket:
+                del bucket[key]
+                removed += 1
+        return removed
 
     def pipeline(self):
         return MockPipeline(self)
@@ -376,6 +469,240 @@ async def test_registry_tracks_execution_lifecycle():
     await registry.mark_execution_finished("exec-1", "sess-1", "CANCELLED")
     finished = await registry.get_execution("exec-1", "sess-1")
     assert finished["status"] == "CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_worker_execution_indexes_track_active_and_history():
+    """Test worker stats track active and historical state incrementally."""
+    redis_mock = MockRedis()
+    registry = WorkerRegistry(redis_mock)
+
+    await registry.initialize_execution(
+        {
+            "execution_id": "exec-1",
+            "message_id": "msg-1",
+            "session_id": "sess-1",
+            "target_agent_type": "dummy_agent",
+            "status": "QUEUED",
+        }
+    )
+
+    await registry.update_execution_status(
+        "exec-1", "sess-1", "RUNNING", worker_id="worker-1"
+    )
+
+    active_key = RedisKeys.worker_active_execution_index("worker-1")
+    history_key = RedisKeys.worker_executions("worker-1")
+    active_snapshots_key = RedisKeys.worker_active_snapshots("worker-1")
+    history_snapshots_key = RedisKeys.worker_history_snapshots("worker-1")
+    status_key = RedisKeys.worker_status("worker-1")
+
+    assert "exec-1" in redis_mock.data[active_key]
+    assert "exec-1" in redis_mock.data[history_key]
+    assert "exec-1" in redis_mock.data[active_snapshots_key]
+    assert "exec-1" in redis_mock.data[history_snapshots_key]
+    assert redis_mock.data[status_key]["total_count"] == 1
+    assert redis_mock.data[status_key]["active_count"] == 1
+    assert redis_mock.data[status_key]["running_count"] == 1
+
+    await registry.mark_execution_finished("exec-1", "sess-1", "COMPLETED")
+
+    assert "exec-1" not in redis_mock.data[active_key]
+    assert "exec-1" not in redis_mock.data[active_snapshots_key]
+    assert "exec-1" in redis_mock.data[history_key]
+    assert "exec-1" in redis_mock.data[history_snapshots_key]
+    assert redis_mock.data[status_key]["active_count"] == 0
+    assert redis_mock.data[status_key]["running_count"] == 0
+    assert redis_mock.data[status_key]["completed_count"] == 1
+    assert redis_mock.expires[active_key] == RedisKeys.DEFAULT_SESSION_TTL
+    assert redis_mock.expires[history_key] == RedisKeys.DEFAULT_SESSION_TTL
+    assert redis_mock.expires[active_snapshots_key] == RedisKeys.DEFAULT_SESSION_TTL
+    assert redis_mock.expires[history_snapshots_key] == RedisKeys.DEFAULT_SESSION_TTL
+
+
+@pytest.mark.asyncio
+async def test_get_worker_executions_returns_recent_execution_records():
+    """Test worker execution lookup resolves records through session registries."""
+    redis_mock = MockRedis()
+    registry = WorkerRegistry(redis_mock)
+
+    with patch("by_framework.core.registry.time.time", side_effect=[1, 2, 3]):
+        await registry.save_execution(
+            {
+                "execution_id": "exec-old",
+                "message_id": "msg-old",
+                "session_id": "sess-1",
+                "worker_id": "worker-1",
+                "target_agent_type": "dummy_agent",
+                "status": "RUNNING",
+            }
+        )
+        await registry.mark_execution_finished("exec-old", "sess-1", "COMPLETED")
+        await registry.save_execution(
+            {
+                "execution_id": "exec-new",
+                "message_id": "msg-new",
+                "session_id": "sess-2",
+                "worker_id": "worker-1",
+                "target_agent_type": "dummy_agent",
+                "status": "RUNNING",
+            }
+        )
+
+    executions = await registry.get_worker_executions("worker-1")
+
+    assert [execution["execution_id"] for execution in executions] == [
+        "exec-new",
+        "exec-old",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_worker_executions_can_filter_terminal_records():
+    """Test worker execution lookup can return only active records."""
+    redis_mock = MockRedis()
+    registry = WorkerRegistry(redis_mock)
+
+    await registry.save_execution(
+        {
+            "execution_id": "exec-finished",
+            "message_id": "msg-finished",
+            "session_id": "sess-1",
+            "worker_id": "worker-1",
+            "target_agent_type": "dummy_agent",
+            "status": "RUNNING",
+        }
+    )
+    await registry.mark_execution_finished("exec-finished", "sess-1", "COMPLETED")
+    await registry.save_execution(
+        {
+            "execution_id": "exec-running",
+            "message_id": "msg-running",
+            "session_id": "sess-2",
+            "worker_id": "worker-1",
+            "target_agent_type": "dummy_agent",
+            "status": "RUNNING",
+        }
+    )
+
+    executions = await registry.get_worker_executions(
+        "worker-1", include_terminal=False
+    )
+
+    assert [execution["execution_id"] for execution in executions] == ["exec-running"]
+
+
+@pytest.mark.asyncio
+async def test_get_worker_execution_summary_counts_state_and_liveness():
+    """Test worker summary reads aggregate counts and snapshots."""
+    redis_mock = MockRedis()
+    registry = WorkerRegistry(redis_mock)
+
+    await registry.register_worker_membership("worker-1", ["dummy_agent"])
+    await registry.heartbeat_worker("worker-1")
+    with patch("by_framework.core.registry.time.time", side_effect=[1, 2, 3]):
+        await registry.save_execution(
+            {
+                "execution_id": "exec-completed",
+                "message_id": "msg-completed",
+                "session_id": "sess-1",
+                "worker_id": "worker-1",
+                "target_agent_type": "dummy_agent",
+                "status": "RUNNING",
+            }
+        )
+        await registry.mark_execution_finished("exec-completed", "sess-1", "COMPLETED")
+        await registry.save_execution(
+            {
+                "execution_id": "exec-running",
+                "message_id": "msg-running",
+                "session_id": "sess-2",
+                "worker_id": "worker-1",
+                "target_agent_type": "dummy_agent",
+                "status": "RUNNING",
+            }
+        )
+
+    summary = await registry.get_worker_execution_summary("worker-1")
+
+    assert summary["worker_id"] == "worker-1"
+    assert summary["online"] is True
+    assert summary["agent_types"] == ["dummy_agent"]
+    assert summary["active_count"] == 1
+    assert summary["total_tracked"] == 2
+    assert summary["counts"] == {
+        "total": 2,
+        "active": 1,
+        "queued": 0,
+        "running": 1,
+        "cancelling": 0,
+        "completed": 1,
+        "failed": 0,
+        "cancelled": 0,
+    }
+    assert summary["status_counts"] == {"RUNNING": 1, "COMPLETED": 1}
+    assert [item["execution_id"] for item in summary["active_executions"]] == [
+        "exec-running"
+    ]
+    assert [item["execution_id"] for item in summary["recent_executions"]] == [
+        "exec-running",
+        "exec-completed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_execution_summary_does_not_get_session_executions():
+    """Test worker summary does not perform per-execution session lookups."""
+    redis_mock = MockRedis()
+    registry = WorkerRegistry(redis_mock)
+
+    await registry.save_execution(
+        {
+            "execution_id": "exec-running",
+            "message_id": "msg-running",
+            "session_id": "sess-1",
+            "worker_id": "worker-1",
+            "target_agent_type": "dummy_agent",
+            "status": "RUNNING",
+        }
+    )
+
+    async def fail_get_execution(*args, **kwargs):  # pylint: disable=unused-argument
+        raise AssertionError("get_execution should not be used by worker summary")
+
+    registry.get_execution = fail_get_execution
+
+    summary = await registry.get_worker_execution_summary("worker-1")
+
+    assert summary["counts"]["running"] == 1
+    assert summary["active_executions"][0]["execution_id"] == "exec-running"
+
+
+@pytest.mark.asyncio
+async def test_worker_execution_summary_can_return_counts_only():
+    """Test worker summary can skip active and recent snapshot reads."""
+    redis_mock = MockRedis()
+    registry = WorkerRegistry(redis_mock)
+
+    await registry.save_execution(
+        {
+            "execution_id": "exec-running",
+            "message_id": "msg-running",
+            "session_id": "sess-1",
+            "worker_id": "worker-1",
+            "target_agent_type": "dummy_agent",
+            "status": "RUNNING",
+        }
+    )
+
+    summary = await registry.get_worker_execution_summary(
+        "worker-1", active_limit=0, history_limit=0
+    )
+
+    assert summary["counts"]["total"] == 1
+    assert summary["counts"]["active"] == 1
+    assert summary["active_executions"] == []
+    assert summary["recent_executions"] == []
 
 
 @pytest.mark.asyncio

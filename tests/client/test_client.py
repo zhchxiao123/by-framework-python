@@ -13,6 +13,7 @@ from by_framework.core.protocol.commands import (
     command_from_dict,
 )
 from by_framework.core.protocol.message import (BaiYingMessage, BaiYingMessageRole)
+from by_framework.errors import WorkerRegistryNotSetError
 
 
 @pytest.mark.asyncio
@@ -79,6 +80,31 @@ async def test_resolve_agent_type_route():
         "stream_name": "byai_gateway:ctrl:agent_type:langgraph_agent",
         "target_worker_id": "",
     }
+
+
+@pytest.mark.asyncio
+async def test_client_get_worker_status_delegates_to_registry():
+    """Test client worker status lookup delegates to WorkerRegistry."""
+    mock_registry = AsyncMock()
+    mock_registry.get_worker_execution_summary.return_value = {
+        "worker_id": "worker-1",
+        "active_count": 1,
+    }
+    client = GatewayClient(redis_client=AsyncMock(), registry=mock_registry)
+
+    result = await client.get_worker_status("worker-1")
+
+    assert result == {"worker_id": "worker-1", "active_count": 1}
+    mock_registry.get_worker_execution_summary.assert_awaited_once_with("worker-1")
+
+
+@pytest.mark.asyncio
+async def test_client_get_worker_status_requires_registry():
+    """Test client worker status lookup requires a registry."""
+    client = GatewayClient(redis_client=AsyncMock(), registry=None)
+
+    with pytest.raises(WorkerRegistryNotSetError):
+        await client.get_worker_status("worker-1")
 
 
 @pytest.mark.asyncio

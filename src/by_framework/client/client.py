@@ -155,6 +155,12 @@ class GatewayClient:
                 results.append(dict(json.loads(raw)))
         return results
 
+    async def get_worker_status(self, worker_id: str) -> Dict[str, Any]:
+        """Return worker liveness metadata and execution state summary."""
+        if self.registry is None:
+            raise WorkerRegistryNotSetError("get worker status")
+        return await self.registry.get_worker_execution_summary(worker_id)
+
     async def _resolve_agent_type_route(
         self, target_agent_type: str, require_online_worker: bool
     ) -> RouteResolution:

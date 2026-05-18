@@ -1,11 +1,11 @@
 [project]
 name = "by-framework-adk"
-version = "0.0.1"
+version = "0.0.2"
 description = "ADK integration for by-framework"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "by-framework>=0.2.0",
+    "by-framework>=0.2.1",
     "google-adk",
     "google-genai",
 ]

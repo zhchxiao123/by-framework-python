@@ -63,7 +63,7 @@ jobs:
               echo "package_name=by-framework-adk" >> "$GITHUB_OUTPUT"
               echo "package_dir=libs/by-framework-adk" >> "$GITHUB_OUTPUT"
               echo "version=${REF_NAME#by-framework-adk-v}" >> "$GITHUB_OUTPUT"
-              ;;              
+              ;;
             *)
               echo "Unsupported tag: $REF_NAME" >&2
               exit 1
@@ -152,6 +152,10 @@ jobs:
           ref: ${{ github.ref }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
 
       - name: Create release branch
         env:
@@ -169,20 +173,36 @@ jobs:
           PACKAGE_DIR: ${{ needs.resolve-package.outputs.package_dir }}
           VERSION: ${{ needs.resolve-package.outputs.version }}
         run: |
-          # Calculate next dev version (e.g., 0.2.1 -> 0.2.2.dev0)
-          IFS='.' read -ra PARTS <<< "$VERSION"
-          LAST_INDEX=$((${#PARTS[@]} - 1))
-          PARTS[$LAST_INDEX]=$((PARTS[$LAST_INDEX] + 1))
-          NEXT_VERSION=$(IFS='.'; echo "${PARTS[*]}").dev0
+          # Calculate next version using Python to support pre-releases (e.g., 0.2.3b0 -> 0.2.3b1, 0.2.3 -> 0.2.4.dev0)
+          NEXT_VERSION=$(python -c 'if True:
+              import re, sys
+              version = sys.argv[1]
+              match = re.search(r"(a|b|rc|dev)(\d+)$", version)
+              if match:
+                  prefix = version[:match.start()]
+                  suffix_type = match.group(1)
+                  suffix_num = int(match.group(2))
+                  print(f"{prefix}{suffix_type}{suffix_num + 1}")
+              else:
+                  parts = version.split(".")
+                  try:
+                      parts[-1] = str(int(parts[-1]) + 1)
+                      print(".".join(parts) + ".dev0")
+                  except ValueError:
+                      print(version + ".dev0")
+          ' "$VERSION")
 
           PYPROJECT="${PACKAGE_DIR}/pyproject.toml"
           sed -i "s/version = \"${VERSION}\"/version = \"${NEXT_VERSION}\"/" "$PYPROJECT"
+
+          # Regenerate uv.lock to align with the new version bump in workspace
+          uv lock
 
           BUMP_BRANCH="bump/${PACKAGE_NAME}/v${NEXT_VERSION}"
           git checkout -b "$BUMP_BRANCH"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$PYPROJECT"
+          git add "$PYPROJECT" uv.lock
           git commit -m "chore: bump ${PACKAGE_NAME} version to ${NEXT_VERSION}"
           git push origin "$BUMP_BRANCH"
 

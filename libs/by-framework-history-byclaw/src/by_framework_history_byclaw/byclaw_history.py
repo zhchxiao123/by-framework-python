@@ -5,6 +5,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 import httpx
+import json
 from by_framework.common.logger import get_logger
 from by_framework.core.discovery import DiscoveryClient
 from by_framework.core.runtime.history.base import BaseHistoryBackend
@@ -152,16 +153,39 @@ class ByClawHistoryBackend(BaseHistoryBackend):
                 else item.get("role", "unknown")
             )
             # 兼容多种字段名：messageContent 是 ByClaw 风格，content 是标准风格
-            content = item.get("messageContent") or item.get("content") or ""
+            raw_content = item.get("messageContent") or item.get("content") or ""
+            relatedResources = item.get("relatedResources")
+            files = []
+            if relatedResources:
+                try:
+                    res_dict = json.loads(relatedResources)
+                    files = res_dict.get("files") or []
+                except Exception:
+                    pass
 
-            if role and content:
-                transformed.append(
-                    {
-                        "role": role,
-                        "content": content,
-                        "metadata": item.get("metadata", {}),
-                    }
-                )
+            if role and (raw_content or files):
+                content_list = []
+                if raw_content:
+                    content_list.append({
+                        "type": "text",
+                        "text": raw_content
+                    })
+                
+                if files:
+                    for f in files:
+                        content_list.append({
+                            "type": "file",
+                            "file": f
+                        })
+
+                message = {
+                    "role": role,
+                    "content": content_list,
+                    "metadata": item.get("metadata", {}),
+                }
+                transformed.append(message)
+
+            
         return transformed
 
     async def save_message(

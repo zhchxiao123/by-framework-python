@@ -101,8 +101,16 @@ async def test_byclaw_history_backend_with_discovery() -> None:
 
     # Verify transformed results
     assert history == [
-        {"role": "user", "content": [{"type": "text", "text": "hello from discovery"}], "metadata": {}},
-        {"role": "assistant", "content": [{"type": "text", "text": "response from discovery"}], "metadata": {}},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello from discovery"}],
+            "metadata": {},
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "response from discovery"}],
+            "metadata": {},
+        },
     ]
 
 

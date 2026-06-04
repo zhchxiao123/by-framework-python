@@ -107,6 +107,17 @@ class RedisKeys:
         """All subtask results Hash Key for a task group."""
         return f"byai_gateway:task_group:{group_id}:results"
 
+    @staticmethod
+    def task_group_results_stream(group_id: str) -> str:
+        """Stream notifying ``collect_group_results`` of new result entries.
+
+        Each ``xadd`` entry corresponds to one HSET into
+        ``task_group_results(group_id)``. ``collect_group_results`` uses
+        ``XREAD BLOCK`` against this stream to wake up promptly when a
+        worker publishes a result, instead of polling HGETALL.
+        """
+        return f"byai_gateway:task_group:{group_id}:results_stream"
+
     # --- Registry ---
     # Set of known workers used for registry enumeration.
     KNOWN_WORKERS = "byai_gateway:registry:workers"

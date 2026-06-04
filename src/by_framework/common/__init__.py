@@ -28,6 +28,14 @@ from .config import (
 from .constants import RedisKeys
 from .emitter import (DataLayoutBuilder, DefaultSseLayoutBuilder, GatewayDataEmitter)
 from .logger import get_logger, logger, setup_logging
+from .metrics import (
+    MESSAGE_PARSE_FAILURES_COUNTER,
+    PLUGIN_RELOAD_FAILURES_COUNTER,
+    REGISTRY_FAILURES_COUNTER,
+    InMemoryCounter,
+    InMemoryGauge,
+    record_failure,
+)
 from .redis_client import Redis, close_redis, get_redis, init_redis
 
 __all__ = [
@@ -49,6 +57,13 @@ __all__ = [
     "LoggingConfig",
     "get_config",
     "init_config",
+    # Metrics
+    "InMemoryCounter",
+    "InMemoryGauge",
+    "REGISTRY_FAILURES_COUNTER",
+    "MESSAGE_PARSE_FAILURES_COUNTER",
+    "PLUGIN_RELOAD_FAILURES_COUNTER",
+    "record_failure",
     # Exceptions
     "FrameworkError",
     "RedisConnectionError",

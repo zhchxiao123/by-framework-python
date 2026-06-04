@@ -29,6 +29,7 @@ from by_framework.common.constants import (
 )
 from by_framework.common.emitter import DataLayoutBuilder, GatewayDataEmitter
 from by_framework.common.logger import logger
+from by_framework.common.metrics import REGISTRY_FAILURES_COUNTER, record_failure
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.availability import (
     AvailabilityRouter,
@@ -52,6 +53,7 @@ from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.core.runtime import AgentRuntimeState
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.runtime.filestore.base import FileStorage
+from by_framework.worker._response_buffer import ResponseBuffer
 
 if TYPE_CHECKING:
     from by_framework.core.extensions import PluginRegistry
@@ -61,6 +63,53 @@ if TYPE_CHECKING:
 _current_ids_var: ContextVar[tuple[str, str]] = ContextVar(
     "_current_ids_var", default=("", "")
 )
+
+# Exception buckets used to discriminate "network" vs "schema/protocol"
+# failures when downgrading past registry / execution-tracking errors.
+# Defined as tuples so they can be used directly in ``except`` clauses
+# without a custom base class. ``redis.ResponseError`` /
+# ``redis.exceptions.ConnectionError`` / ``redis.exceptions.DataError``
+# are imported lazily inside call sites that need them, because the
+# ``redis`` package may not be installed in every test environment.
+def _build_registry_error_buckets() -> tuple[
+    tuple[type[BaseException], ...],
+    tuple[type[BaseException], ...],
+]:
+    """Return (network_bucket, schema_bucket) for registry-call downgrade paths.
+
+    Splitting the buckets lets the call site log a different message
+    depending on whether the registry was unreachable (transient, can
+    retry next request) or rejected the payload (almost certainly a
+    protocol/schema bug we want to see immediately).
+    """
+    schema_bucket: list[type[BaseException]] = [
+        ValueError,
+        TypeError,
+        AttributeError,
+        KeyError,
+    ]
+    try:
+        from redis.exceptions import (  # type: ignore[import-not-found]
+            ConnectionError as RedisConnectionError,
+            DataError,
+            ResponseError,
+            TimeoutError as RedisTimeoutError,
+        )
+
+        network_bucket: tuple[type[BaseException], ...] = (
+            asyncio.TimeoutError,
+            ConnectionError,
+            RedisConnectionError,
+            RedisTimeoutError,
+        )
+        schema_bucket.extend([ResponseError, DataError])
+    except ImportError:
+        # ``redis`` is not installed; fall back to stdlib only.
+        network_bucket = (asyncio.TimeoutError, ConnectionError)
+    return tuple(network_bucket), tuple(schema_bucket)
+
+
+_RegistryNetworkError, _RegistrySchemaError = _build_registry_error_buckets()
 
 
 class AgentContext:
@@ -126,14 +175,7 @@ class AgentContext:
         self.emitter = GatewayDataEmitter(
             self.redis, data_stream_name, layout_builder=layout_builder
         )
-        self._response_buffer = []  # Used to collect streaming response content
-        self._is_history_saved = False  # Prevent duplicate saves
-        self._is_stream_finished = False  # Flag: has APP_STREAM_RESPONSE been sent
         self.content_codec = content_codec
-        # Flag: stream permission transferred to sub-calls not waiting
-        self._permission_transferred = False
-        # Flag: execution suspended due to calling agents or waiting
-        self._is_suspended = False
         self.plugin_registry = plugin_registry
         self.agent_configs_version = agent_configs_version
         self.is_sub_agent = is_sub_agent
@@ -148,6 +190,17 @@ class AgentContext:
             agent_configs=agent_configs,
             permission_policy=permission_policy,
             agent_id=current_agent_id,
+        )
+
+        # Streaming response buffer + per-stream lifecycle flags.
+        # parent_message_id is read via a callable because it is stored
+        # in a ContextVar and may change during this context's lifetime
+        # (see AgentContext.parent_message_id setter).
+        self._buffer = ResponseBuffer(
+            history=self._agent_runtime_state.session_manager.history,
+            trace_id=self.trace_id,
+            agent_id=self.current_agent_id,
+            parent_message_id_provider=lambda: self.parent_message_id,
         )
 
     @property
@@ -260,6 +313,54 @@ class AgentContext:
     def is_cancel_requested(self) -> bool:
         return bool(self.cancel_event and self.cancel_event.is_set())
 
+    # ------------------------------------------------------------------
+    # Backward-compatible shims for the legacy ``_response_buffer`` /
+    # ``_is_*`` / ``_permission_transferred`` attributes. The state now
+    # lives in ``self._buffer`` (a ``ResponseBuffer``); these properties
+    # delegate to it so that external readers and writers (worker.py,
+    # processor.py, test_gateway_worker.py) keep working unchanged.
+    # ------------------------------------------------------------------
+    @property
+    def _response_buffer(self) -> List[str]:
+        """Return the underlying response chunks list.
+
+        Retained for backward compatibility. Callers should not mutate
+        the returned list; new code should go through
+        ``self._buffer`` / ``self._buffer.append``.
+        """
+        return self._buffer.chunks()
+
+    @property
+    def _is_history_saved(self) -> bool:
+        return self._buffer.is_history_saved()
+
+    @property
+    def _is_stream_finished(self) -> bool:
+        return self._buffer.is_finished()
+
+    @_is_stream_finished.setter
+    def _is_stream_finished(self, value: bool) -> None:
+        if value:
+            self._buffer.mark_finished()
+
+    @property
+    def _permission_transferred(self) -> bool:
+        return self._buffer.is_permission_transferred()
+
+    @_permission_transferred.setter
+    def _permission_transferred(self, value: bool) -> None:
+        if value:
+            self._buffer.mark_permission_transferred()
+
+    @property
+    def _is_suspended(self) -> bool:
+        return self._buffer.is_suspended()
+
+    @_is_suspended.setter
+    def _is_suspended(self, value: bool) -> None:
+        if value:
+            self._buffer.mark_suspended()
+
     async def check_cancelled(self) -> None:
         if self.is_cancel_requested():
             raise asyncio.CancelledError(self.cancel_reason or "task cancelled")
@@ -306,7 +407,7 @@ class AgentContext:
             content = event
 
         if content:
-            self._response_buffer.append(content)
+            self._buffer.append(content)
 
         # Check if this is a stream end marker
         if event_type == EventType.APP_STREAM_RESPONSE.value:
@@ -324,10 +425,10 @@ class AgentContext:
                     self.trace_id,
                     self.current_agent_id,
                 )
-                await self.flush_to_history()
+                await self._buffer.flush_to_history()
                 return
 
-            self._is_stream_finished = True
+            self._buffer.mark_finished()
 
         # 2. Send raw chunk
         await self.emitter.emit_chunk(
@@ -345,24 +446,11 @@ class AgentContext:
 
         # 3. If it's a stream end marker, trigger persistence to history
         if event_type == EventType.APP_STREAM_RESPONSE.value:
-            await self.flush_to_history()
+            await self._buffer.flush_to_history()
 
     async def flush_to_history(self) -> None:
         """Persist the current buffer content as an assistant reply to history"""
-        if self._is_history_saved or not self._response_buffer:
-            return
-
-        full_content = "".join(self._response_buffer)
-        await self.agent_runtime_state.session_manager.history.save_message(
-            role="assistant",
-            content=full_content,
-            metadata={
-                "trace_id": self.trace_id,
-                "agent_id": self.current_agent_id,
-                "parent_message_id": self.parent_message_id,
-            },
-        )
-        self._is_history_saved = True
+        await self._buffer.flush_to_history()
 
     async def emit_state(
         self,
@@ -426,7 +514,7 @@ class AgentContext:
             if parent_message_id
             else self.parent_message_id,
         )
-        self._is_suspended = True
+        self._buffer.mark_suspended()
         return {"status": AgentState.WAITING_USER.value}
 
     async def update_execution_state(self, status: str) -> None:
@@ -434,13 +522,57 @@ class AgentContext:
 
         Does not mix state data into the data stream returned to the frontend;
         operates entirely on the control channel.
+
+        Failures are downgraded (logged as warnings + recorded on
+        ``REGISTRY_FAILURES_COUNTER``) rather than raised, because the
+        control-channel state is an observability aid and must never
+        break a running agent.
         """
         from by_framework.core.registry import WorkerRegistry
 
         registry = WorkerRegistry(self.redis)
-        if hasattr(registry, "update_execution_status_by_message"):
+        if not hasattr(registry, "update_execution_status_by_message"):
+            logger.info(
+                "[%s] registry lacks update_execution_status_by_message; "
+                "skipping execution state update for status=%s",
+                self.trace_id,
+                status,
+            )
+            return
+
+        try:
             await registry.update_execution_status_by_message(
                 self.message_id, self.session_id, status
+            )
+        except _RegistryNetworkError as net_err:
+            # Network / connectivity — almost always transient. We continue
+            # because the caller's primary work is unaffected.
+            record_failure(
+                REGISTRY_FAILURES_COUNTER,
+                operation="update_execution_state",
+                error=net_err,
+            )
+            logger.warning(
+                "[%s] registry unreachable while updating execution state; "
+                "continuing without execution tracking. status=%s err=%s",
+                self.trace_id,
+                status,
+                net_err,
+            )
+        except _RegistrySchemaError as schema_err:
+            # Schema / protocol mismatch with the registry backend. Not
+            # transient; we surface the details but do not break the agent.
+            record_failure(
+                REGISTRY_FAILURES_COUNTER,
+                operation="update_execution_state",
+                error=schema_err,
+            )
+            logger.warning(
+                "[%s] registry rejected execution state update "
+                "(schema/protocol error); continuing. status=%s err=%s",
+                self.trace_id,
+                status,
+                schema_err,
             )
 
     async def call_agent(
@@ -469,9 +601,9 @@ class AgentContext:
         merged_extra_payload = dict(extra_payload or {})
         if wait_for_reply:
             merged_extra_payload["wait_for_reply"] = True
-            self._is_suspended = True
+            self._buffer.mark_suspended()
         else:
-            self._permission_transferred = True
+            self._buffer.mark_permission_transferred()
 
         serialized_content = self._serialize_outbound_content(content)
 
@@ -559,8 +691,46 @@ class AgentContext:
                         "status": "QUEUED",
                     }
                 )
-            except Exception:  # pylint: disable=broad-exception-caught
-                pass  # Fallback if registry fails
+            except _RegistryNetworkError as net_err:
+                # Network is down or Redis timed out — we can still
+                # dispatch the command on the data stream. The
+                # execution-tracking row will simply be missing; we
+                # surface the gap on the registry-failure counter and
+                # a single warning line.
+                record_failure(
+                    REGISTRY_FAILURES_COUNTER,
+                    operation="call_agent.initialize_execution",
+                    error=net_err,
+                )
+                logger.warning(
+                    "[%s] registry not available, continuing without "
+                    "execution tracking. target_agent_type=%s execution_id=%s "
+                    "err=%s",
+                    self.trace_id,
+                    target_agent_type,
+                    execution_id,
+                    net_err,
+                )
+            except _RegistrySchemaError as schema_err:
+                # Schema / protocol mismatch — the registry is up but
+                # the payload we built does not match its expectations.
+                # This is a bug we want to see in the logs, but it must
+                # not abort the dispatch.
+                record_failure(
+                    REGISTRY_FAILURES_COUNTER,
+                    operation="call_agent.initialize_execution",
+                    error=schema_err,
+                )
+                logger.warning(
+                    "[%s] registry rejected execution payload "
+                    "(schema/protocol error); continuing without "
+                    "execution tracking. target_agent_type=%s "
+                    "execution_id=%s err=%s",
+                    self.trace_id,
+                    target_agent_type,
+                    execution_id,
+                    schema_err,
+                )
 
         try:
             if should_dispatch_control:
@@ -619,9 +789,9 @@ class AgentContext:
             )
             # Ensure the key expires to prevent leak
             await self.redis.expire(group_key, TASK_GROUP_TTL_SECONDS)
-            self._is_suspended = True
+            self._buffer.mark_suspended()
         else:
-            self._permission_transferred = True
+            self._buffer.mark_permission_transferred()
 
         dispatched = []
         for task in tasks:
@@ -682,8 +852,40 @@ class AgentContext:
                             "status": "QUEUED",
                         }
                     )
-                except Exception:  # pylint: disable=broad-exception-caught
-                    pass  # Fallback if registry fails
+                except _RegistryNetworkError as net_err:
+                    record_failure(
+                        REGISTRY_FAILURES_COUNTER,
+                        operation="dispatch_group.initialize_execution",
+                        error=net_err,
+                    )
+                    logger.warning(
+                        "[%s] registry not available for task group; "
+                        "continuing without execution tracking. "
+                        "task_group_id=%s target_agent_type=%s "
+                        "execution_id=%s err=%s",
+                        self.trace_id,
+                        task_group_id,
+                        target_agent_type,
+                        execution_id,
+                        net_err,
+                    )
+                except _RegistrySchemaError as schema_err:
+                    record_failure(
+                        REGISTRY_FAILURES_COUNTER,
+                        operation="dispatch_group.initialize_execution",
+                        error=schema_err,
+                    )
+                    logger.warning(
+                        "[%s] registry rejected task-group execution "
+                        "payload (schema/protocol error); continuing. "
+                        "task_group_id=%s target_agent_type=%s "
+                        "execution_id=%s err=%s",
+                        self.trace_id,
+                        task_group_id,
+                        target_agent_type,
+                        execution_id,
+                        schema_err,
+                    )
 
             await self.redis.xadd(
                 RedisKeys.ctrl_stream(target_agent_type), command.to_redis_payload()
@@ -728,8 +930,17 @@ class AgentContext:
     ) -> list[dict[str, Any]]:
         """Collect results of all subtasks in the task group.
 
-        Called when last subtask completes. Returns collected results
-        if timeout is reached before all complete.
+        Waits for the task group to complete (or ``timeout`` to elapse)
+        by combining an initial ``HGETALL`` snapshot with an
+        ``XREAD BLOCK`` against ``task_group_results_stream``. Each
+        notification on the stream signals that a new result has been
+        HSET into the results hash, so the collector re-snapshots the
+        hash and resumes blocking. This eliminates the previous
+        100 ms-polling loop when the writer is a cooperating worker
+        that emits notifications (``worker.py`` does so on every
+        completed subtask). When notifications are missing for any
+        reason (older workers, partial failures), the loop falls back
+        to a 200 ms safety poll so the API is still progress-bounded.
 
         Args:
             task_group_id: task_group_id returned by dispatch_group
@@ -749,6 +960,7 @@ class AgentContext:
 
         results_key = RedisKeys.task_group_results(task_group_id)
         group_key = RedisKeys.task_group(task_group_id)
+        results_stream = RedisKeys.task_group_results_stream(task_group_id)
 
         total_str = await self.redis.hget(group_key, TASK_GROUP_FIELD_TOTAL)
         if total_str is None:
@@ -757,27 +969,85 @@ class AgentContext:
         else:
             total = int(total_str)
 
-        start_time = asyncio.get_running_loop().time()
-        results: list[dict[str, Any]] = []
+        def _parse_results(
+            raw_results: dict[Any, Any],
+        ) -> list[dict[str, Any]]:
+            return [
+                {
+                    "message_id": msg_id,
+                    **json.loads(data),
+                }
+                for msg_id, data in raw_results.items()
+            ]
 
-        while len(results) < total:
+        start_time = asyncio.get_running_loop().time()
+
+        # 1) Take an initial snapshot to handle the "writer finished
+        #    before we got here" race — if every subtask already
+        #    completed before this call, we must not block waiting
+        #    for a notification that will never arrive.
+        raw_results = await self.redis.hgetall(results_key)
+        results = _parse_results(raw_results) if raw_results else []
+        if len(results) >= total:
+            return results
+
+        # 2) Block on the per-group notification stream. Each XADD in
+        #    the writer fires one entry; we re-snapshot the hash to
+        #    read the full, ordered result set.
+        while True:
             elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed >= timeout:
                 break
 
-            raw_results = await self.redis.hgetall(results_key)
-            if raw_results:
-                results = [
-                    {
-                        "message_id": msg_id,
-                        **json.loads(data),
-                    }
-                    for msg_id, data in raw_results.items()
-                ]
-                if len(results) >= total:
-                    break
+            remaining_ms = max(1, int((timeout - elapsed) * 1000))
+            # Bound each XREAD BLOCK call to a fraction of the
+            # remaining budget so timeout enforcement is precise.
+            block_ms = min(remaining_ms, 2000)
 
-            # Wait a bit before polling again
-            await asyncio.sleep(0.1)
+            try:
+                response = await self.redis.xread(
+                    streams={results_stream: "$"},
+                    count=1,
+                    block=block_ms,
+                )
+            except (TypeError, ValueError):
+                # Some test doubles (e.g. LocalMemoryMQ) don't accept
+                # ``block``/``count`` kwargs. Fall back to a short
+                # sleep so the loop remains cooperative.
+                await asyncio.sleep(0.05)
+                response = None
+            except Exception:
+                # Don't let a transport error kill the collector; fall
+                # back to a short sleep and let the next iteration
+                # retry.
+                await asyncio.sleep(0.05)
+                response = None
+
+            if response:
+                # Drain any other queued notifications: we only need
+                # one HGETALL, so skip ahead to the last entry.
+                for _ in response[-1][1][1:]:
+                    pass
+                raw_results = await self.redis.hgetall(results_key)
+                if raw_results:
+                    results = _parse_results(raw_results)
+                if len(results) >= total:
+                    return results
+                # Got a notification but results still short; the
+                # total may have been misreported (race with
+                # dispatch_group). Re-block and keep waiting.
+                continue
+
+            # 3) No notification this round. Re-snapshot periodically
+            #    in case the writer is an older worker that doesn't
+            #    emit notifications. Re-snapshot at most every
+            #    POLL_INTERVAL_SECONDS so we don't hammer Redis.
+            POLL_INTERVAL_SECONDS = 0.2
+            if raw_results or elapsed >= POLL_INTERVAL_SECONDS:
+                raw_results = await self.redis.hgetall(results_key)
+                if raw_results:
+                    results = _parse_results(raw_results)
+                    if len(results) >= total:
+                        return results
 
         return results

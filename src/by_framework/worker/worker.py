@@ -533,6 +533,18 @@ class GatewayWorker(ABC):
                                 json.dumps(result_data),
                             )
                             await self.redis.expire(results_key, TASK_GROUP_TTL_SECONDS)
+                            # Notify any blocked collect_group_results so it
+                            # can wake up via XREAD BLOCK and re-read the
+                            # full hash snapshot. The notification payload
+                            # is intentionally minimal: collectors use
+                            # HGETALL for the authoritative result, not
+                            # the stream payload.
+                            await self.redis.xadd(
+                                RedisKeys.task_group_results_stream(
+                                    header.task_group_id
+                                ),
+                                {"message_id": header.message_id},
+                            )
 
                         completed = await self.redis.hincrby(
                             group_key, TASK_GROUP_FIELD_COMPLETED, 1

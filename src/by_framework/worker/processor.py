@@ -2,6 +2,7 @@
 
 # pylint: disable=wrong-import-position
 
+import asyncio
 import traceback
 import uuid
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
@@ -155,9 +156,42 @@ class GatewayProcessor:
 
             return result
 
+        except asyncio.CancelledError:
+            # Cooperative cancellation — propagate without reformatting.
+            raise
+        except (OSError, ConnectionError) as conn_err:
+            # Redis / network outage. The user's handler cannot do its
+            # work; we still report the failure to the source agent so
+            # the call graph unblocks.
+            self.logger.error(
+                "[%s] Connection error during processing: %s",
+                self.worker_id,
+                conn_err,
+            )
+            self.logger.debug(
+                "[%s] Connection stack: %s",
+                self.worker_id,
+                traceback.format_exc(),
+            )
+            if has_source_agent:
+                await self._enqueue_callback(
+                    command, AgentState.FAILED.value, {"error": str(conn_err)}
+                )
+            await context.emit_state(
+                StateChangeEvent(
+                    state=f"{AgentState.FAILED.value}: {str(conn_err)}"
+                )
+            )
+            raise
         except Exception as e:
-            self.logger.error("[%s] Processing failed: %s", self.worker_id, str(e))
-            self.logger.error(traceback.format_exc())
+            # User-handler bug. We log the full stack via
+            # ``logger.exception`` (exc_info=True by default) so that
+            # the failure is debuggable from the log alone, then we
+            # surface the failure to the source agent (if any) and
+            # re-raise so the outer runner can react.
+            self.logger.exception(
+                "[%s] Processing failed: %s", self.worker_id, str(e)
+            )
 
             if has_source_agent:
                 await self._enqueue_callback(

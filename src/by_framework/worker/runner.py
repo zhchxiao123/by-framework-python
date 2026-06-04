@@ -18,8 +18,13 @@ from by_framework.common.constants import (
     RedisKeys,
 )
 from by_framework.common.logger import logger
+from by_framework.common.metrics import (
+    MESSAGE_PARSE_FAILURES_COUNTER,
+    record_failure,
+)
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.protocol.agent_state import TERMINAL_STATES, AgentState
+from by_framework.errors import UnsupportedCommandError
 from by_framework.core.protocol.commands import (
     CancelTaskCommand,
     ReloadPluginsCommand,
@@ -138,8 +143,22 @@ class WorkerRunner:
                     try:
                         data_dict = await parse_message_data(msg_data)
                         results.append((stream_name, msg_id, data_dict))
-                    except Exception:  # pylint: disable=broad-exception-caught
-                        logger.error("Failed to parse message: %s", msg_id)
+                    except (ValueError, KeyError, TypeError) as parse_err:
+                        # Bad payload (malformed JSON, missing fields, wrong
+                        # shape) — we log once, bump the parse-failure counter
+                        # and ack the message so it does not loop forever.
+                        record_failure(
+                            MESSAGE_PARSE_FAILURES_COUNTER,
+                            operation="fetch_messages.parse_message_data",
+                            error=parse_err,
+                        )
+                        logger.warning(
+                            "[%s] Failed to parse message %s on stream %s: %s",
+                            self.worker.worker_id,
+                            msg_id,
+                            stream_name,
+                            parse_err,
+                        )
                         continue
         return results
 
@@ -181,8 +200,35 @@ class WorkerRunner:
                         await self._process_message_from_dict(
                             current_stream_name, msg_id, data_dict
                         )
-                except Exception as e:  # pylint: disable=broad-exception-caught
-                    logger.error("Invalid control message %s: %s", msg_id, e)
+                except (ValueError, KeyError, TypeError, UnsupportedCommandError) as parse_err:
+                    # Bad payload — log, count, and ack so the consumer
+                    # does not see the same broken message forever.
+                    record_failure(
+                        MESSAGE_PARSE_FAILURES_COUNTER,
+                        operation="_run_control_once.parse_control_command",
+                        error=parse_err,
+                    )
+                    logger.warning(
+                        "[%s] Invalid control message %s: %s",
+                        self.worker.worker_id,
+                        msg_id,
+                        parse_err,
+                    )
+                except asyncio.CancelledError:
+                    # Cooperative cancellation — propagate to let the
+                    # outer task shut down cleanly.
+                    raise
+                except (OSError, ConnectionError) as conn_err:
+                    # Redis / network error — we cannot reach the bus to
+                    # ack or process. Re-raise so the outer loop sees it
+                    # and applies its backoff policy.
+                    logger.error(
+                        "[%s] Connection error processing control message %s: %s",
+                        self.worker.worker_id,
+                        msg_id,
+                        conn_err,
+                    )
+                    raise
                 finally:
                     await self.redis.xack(current_stream_name, self.group_name, msg_id)
 
@@ -234,8 +280,27 @@ class WorkerRunner:
                 task.add_done_callback(self._running_tasks.discard)
 
             return True
+        except asyncio.CancelledError:
+            # Cooperative cancellation — never swallow.
+            raise
+        except (OSError, ConnectionError) as conn_err:
+            # Redis / network outage. We log loudly (this is a real error)
+            # and back off; the outer loop will retry on the next tick.
+            logger.error(
+                "[%s] Connection error in _run_once: %s",
+                self.worker.worker_id,
+                conn_err,
+            )
+            self.semaphore.release()
+            return False
         except Exception as e:  # pylint: disable=broad-exception-caught
-            logger.error("Error in _run_once: %s", e)
+            # Truly unexpected — keep the loop alive but make sure the
+            # stack lands in the log so the bug is debuggable.
+            logger.exception(
+                "[%s] Unexpected error in _run_once: %s",
+                self.worker.worker_id,
+                e,
+            )
             self.semaphore.release()
             return False
 
@@ -392,8 +457,19 @@ class WorkerRunner:
         except UnsupportedCommandError:
             logger.error("Unsupported command in message %s", msg_id)
             await self.redis.xack(stream_name, self.group_name, msg_id)
+        except asyncio.CancelledError:
+            # Cooperative cancellation — propagate.
+            raise
         except Exception as e:  # pylint: disable=broad-exception-caught
-            logger.error("Error processing message %s: %s", msg_id, e)
+            # Keep the message-pump loop alive; surface the stack so
+            # the failure is debuggable. ``logger.exception`` records
+            # ``exc_info`` automatically.
+            logger.exception(
+                "[%s] Error processing message %s: %s",
+                self.worker.worker_id,
+                msg_id,
+                e,
+            )
         finally:
             # Clean up tracking
             message_id = data_dict.get("header", {}).get("message_id", "")

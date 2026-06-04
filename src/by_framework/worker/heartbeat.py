@@ -5,6 +5,10 @@ from typing import List, Optional
 
 from by_framework.common.constants import RedisKeys
 from by_framework.common.logger import logger
+from by_framework.common.metrics import (
+    REGISTRY_FAILURES_COUNTER,
+    record_failure,
+)
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.registry import WorkerRegistry
 
@@ -48,9 +52,37 @@ class WorkerHeartbeat:
                         self.worker_id, self.lease_ttl_seconds
                     )
                     logger.debug("[%s] Standalone heartbeat sent", self.worker_id)
+                except asyncio.CancelledError:
+                    # Cooperative shutdown — propagate.
+                    raise
+                except (OSError, ConnectionError) as conn_err:
+                    # Redis / network outage. The lease will eventually
+                    # expire; the next successful heartbeat will renew
+                    # it. Logged at warning level — this is a degraded
+                    # state but not a hard error.
+                    record_failure(
+                        REGISTRY_FAILURES_COUNTER,
+                        operation="heartbeat.heartbeat_worker",
+                        error=conn_err,
+                    )
+                    logger.warning(
+                        "[%s] Standalone heartbeat lost connection: %s",
+                        self.worker_id,
+                        conn_err,
+                    )
                 except Exception as e:  # pylint: disable=broad-exception-caught
-                    logger.error(
-                        "[%s] Standalone heartbeat failed: %s", self.worker_id, e
+                    # Unexpected. Stack the failure into the log and
+                    # keep the heartbeat loop alive so transient
+                    # problems do not kill the worker.
+                    record_failure(
+                        REGISTRY_FAILURES_COUNTER,
+                        operation="heartbeat.heartbeat_worker",
+                        error=e,
+                    )
+                    logger.exception(
+                        "[%s] Standalone heartbeat failed: %s",
+                        self.worker_id,
+                        e,
                     )
                 await asyncio.sleep(self.interval)
 

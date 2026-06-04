@@ -8,6 +8,11 @@ import asyncio
 import json
 
 from by_framework.common.constants import RedisKeys
+from by_framework.common.logger import logger
+from by_framework.common.metrics import (
+    PLUGIN_RELOAD_FAILURES_COUNTER,
+    record_failure,
+)
 from by_framework.core.protocol.commands import (
     AskAgentCommand,
     CancelTaskCommand,
@@ -131,13 +136,51 @@ async def handle_reload_plugins(command: ReloadPluginsCommand, worker) -> None:
                     ),
                 }
             )
-    except Exception as error:
-        recorded = await _get_reload_status(plugin_registry, command.reload_id)
-        if recorded:
-            status_payload.update(recorded)
-        else:
-            status_payload["error"] = str(error)
+    except asyncio.CancelledError:
+        # Cooperative cancellation — propagate.
+        raise
+    except (OSError, ConnectionError) as conn_err:
+        # Redis is down or the network blipped. The reload itself is
+        # already in-flight in the plugin_registry, so we count it,
+        # log the cause, and re-raise so the outer runner can decide
+        # whether to back off.
+        record_failure(
+            PLUGIN_RELOAD_FAILURES_COUNTER,
+            operation="handle_reload_plugins.reload_plugins",
+            error=conn_err,
+        )
+        status_payload["error"] = f"connection error: {conn_err}"
         await _publish_reload_ack(worker, status_payload)
+        logger.error(
+            "[%s] Connection error during plugin reload %s: %s",
+            worker_id,
+            command.reload_id,
+            conn_err,
+        )
+        raise
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+        AttributeError,
+        RuntimeError,
+    ) as plugin_err:
+        # Plugin code itself raised a non-network error. This is almost
+        # always a real bug in a plugin's reload implementation; we want
+        # the full stack so SREs can debug it.
+        record_failure(
+            PLUGIN_RELOAD_FAILURES_COUNTER,
+            operation="handle_reload_plugins.reload_plugins",
+            error=plugin_err,
+        )
+        status_payload["error"] = str(plugin_err)
+        await _publish_reload_ack(worker, status_payload)
+        logger.exception(
+            "[%s] Plugin reload %s failed: %s",
+            worker_id,
+            command.reload_id,
+            plugin_err,
+        )
         raise
 
     await _publish_reload_ack(worker, status_payload)

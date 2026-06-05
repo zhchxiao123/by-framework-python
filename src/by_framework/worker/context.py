@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -52,6 +53,7 @@ from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.core.runtime import AgentRuntimeState
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.runtime.filestore.base import FileStorage
+from by_framework.observability.span_recorder import SpanRecorder, TraceSpan
 
 if TYPE_CHECKING:
     from by_framework.core.extensions import PluginRegistry
@@ -60,6 +62,11 @@ if TYPE_CHECKING:
 # Context variable for tracking current (message_id, parent_message_id)
 _current_ids_var: ContextVar[tuple[str, str]] = ContextVar(
     "_current_ids_var", default=("", "")
+)
+
+# Context variable for tracking current AgentContext
+current_agent_context_var: ContextVar[Optional[AgentContext]] = ContextVar(
+    "current_agent_context_var", default=None
 )
 
 
@@ -105,12 +112,16 @@ class AgentContext:
         content_codec: Optional[ContentCodec] = None,
         layout_builder: Optional[DataLayoutBuilder] = None,
         is_sub_agent: bool = False,
+        execution_id: str = "",
+        span_recorder: Optional[SpanRecorder] = None,
     ):
         self.redis = redis_client or get_redis()
         self.session_id = session_id
         self.trace_id = trace_id
         self.data_stream_name = data_stream_name
         self.current_agent_id = current_agent_id
+        self.execution_id = execution_id
+        self.span_recorder = span_recorder or SpanRecorder(self.redis)
 
         # Record initial IDs
         self._initial_message_id = message_id
@@ -149,6 +160,18 @@ class AgentContext:
             permission_policy=permission_policy,
             agent_id=current_agent_id,
         )
+
+    @asynccontextmanager
+    async def use_context(self):
+        """Asynchronous context manager to bind this AgentContext.
+
+        Binds this context to the current coroutine context.
+        """
+        token = current_agent_context_var.set(self)
+        try:
+            yield
+        finally:
+            current_agent_context_var.reset(token)
 
     @property
     def message_id(self) -> str:
@@ -330,22 +353,70 @@ class AgentContext:
             self._is_stream_finished = True
 
         # 2. Send raw chunk
+        span_started_at = int(time.time() * 1000)
+        emitted_message_id = message_id if message_id else self.message_id
+        emitted_parent_message_id = (
+            parent_message_id if parent_message_id else self.parent_message_id
+        )
         await self.emitter.emit_chunk(
             self.session_id,
             self.trace_id,
             event,
             self.current_agent_id,
-            message_id=message_id if message_id else self.message_id,
-            parent_message_id=parent_message_id
-            if parent_message_id
-            else self.parent_message_id,
+            message_id=emitted_message_id,
+            parent_message_id=emitted_parent_message_id,
             event_type=event_type,
             content_type=content_type,
+        )
+        await self._record_agent_emit_span(
+            operation="agent.emit_chunk",
+            message_id=emitted_message_id,
+            parent_message_id=emitted_parent_message_id,
+            event_type=event_type,
+            start_ts=span_started_at,
+            end_ts=int(time.time() * 1000),
         )
 
         # 3. If it's a stream end marker, trigger persistence to history
         if event_type == EventType.APP_STREAM_RESPONSE.value:
             await self.flush_to_history()
+
+    async def _record_agent_emit_span(
+        self,
+        *,
+        operation: str,
+        message_id: str,
+        parent_message_id: str,
+        event_type: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> None:
+        parent_span_id = (
+            f"{self.execution_id}:worker.execute"
+            if self.execution_id
+            else f"{message_id}:worker.execute"
+        )
+        try:
+            await self.span_recorder.record_span(
+                TraceSpan(
+                    trace_id=self.trace_id,
+                    span_id=f"{message_id}:{operation}",
+                    parent_span_id=parent_span_id,
+                    operation=operation,
+                    component="agent_context",
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    status="COMPLETED",
+                    session_id=self.session_id,
+                    execution_id=self.execution_id,
+                    message_id=message_id,
+                    parent_message_id=parent_message_id,
+                    target_agent_type=self.current_agent_id,
+                    event_type=event_type,
+                )
+            )
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            logger.debug("Failed to record agent emit span: %s", err)
 
     async def flush_to_history(self) -> None:
         """Persist the current buffer content as an assistant reply to history"""
@@ -518,6 +589,24 @@ class AgentContext:
             AvailabilityStatus.FALLBACK_TO_OTHER_AGENT_TYPE,
             AvailabilityStatus.QUEUE_PENDING,
         ):
+            from by_framework.core.registry import WorkerRegistry
+
+            registry_client = WorkerRegistry(self.redis)
+            await registry_client.record_failed_route_decision(
+                execution_id=execution_id,
+                message_id=message_id,
+                session_id=self.session_id,
+                trace_id=self.trace_id,
+                parent_message_id=parent_message_id or "",
+                source_agent_type=self.current_agent_id if wait_for_reply else "",
+                target_agent_type=target_agent_type,
+                route_policy=route_policy,
+                route_status=availability.status,
+                stream_name=availability.stream_name or "",
+                selected_agent_type=availability.selected_agent_type or "",
+                availability_error_code=availability.error_code or "",
+                availability_error=availability.error or "",
+            )
             return {
                 "status": AgentState.FAILED.value,
                 "message_id": "",
@@ -557,14 +646,31 @@ class AgentContext:
                         "target_agent_type": target_agent_type,
                         "stream_name": delivery_stream,
                         "status": "QUEUED",
+                        "route_policy": route_policy,
+                        "route_status": availability.status,
+                        "selected_agent_type": availability.selected_agent_type,
+                        "availability_error_code": availability.error_code,
+                        "availability_error": availability.error,
                     }
                 )
             except Exception:  # pylint: disable=broad-exception-caught
                 pass  # Fallback if registry fails
 
         try:
+            dispatch_started_at = int(time.time() * 1000)
             if should_dispatch_control:
                 await self.redis.xadd(delivery_stream, command.to_redis_payload())
+            await self._record_agent_dispatch_span(
+                message_id=message_id,
+                parent_message_id=parent_message_id,
+                source_agent_type=self.current_agent_id if wait_for_reply else "",
+                target_agent_type=target_agent_type,
+                target_worker_id=availability.target_worker_id,
+                route_policy=route_policy,
+                route_status=availability.status,
+                start_ts=dispatch_started_at,
+                end_ts=int(time.time() * 1000),
+            )
         except Exception as error:
             if self.plugin_registry:
                 await self.plugin_registry.on_call_agent_error(self, command, error)
@@ -579,6 +685,48 @@ class AgentContext:
         if self.plugin_registry:
             await self.plugin_registry.on_call_agent_complete(self, command, result)
         return result
+
+    async def _record_agent_dispatch_span(
+        self,
+        *,
+        message_id: str,
+        parent_message_id: str,
+        source_agent_type: str,
+        target_agent_type: str,
+        target_worker_id: str,
+        route_policy: str,
+        route_status: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> None:
+        parent_span_id = (
+            f"{self.execution_id}:worker.execute"
+            if self.execution_id
+            else f"{self.message_id}:worker.execute"
+        )
+        try:
+            await self.span_recorder.record_span(
+                TraceSpan(
+                    trace_id=self.trace_id,
+                    span_id=f"{message_id}:client.dispatch",
+                    parent_span_id=parent_span_id,
+                    operation="client.dispatch",
+                    component="agent_context",
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    status="COMPLETED",
+                    session_id=self.session_id,
+                    message_id=message_id,
+                    parent_message_id=parent_message_id,
+                    worker_id=target_worker_id,
+                    source_agent_type=source_agent_type,
+                    target_agent_type=target_agent_type,
+                    route_policy=route_policy,
+                    route_status=route_status,
+                )
+            )
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            logger.debug("Failed to record agent dispatch span: %s", err)
 
     async def dispatch_group(
         self,
@@ -685,8 +833,20 @@ class AgentContext:
                 except Exception:  # pylint: disable=broad-exception-caught
                     pass  # Fallback if registry fails
 
+            dispatch_started_at = int(time.time() * 1000)
             await self.redis.xadd(
                 RedisKeys.ctrl_stream(target_agent_type), command.to_redis_payload()
+            )
+            await self._record_agent_dispatch_span(
+                message_id=current_message_id,
+                parent_message_id=parent_message_id,
+                source_agent_type=self.current_agent_id if wait_for_reply else "",
+                target_agent_type=target_agent_type,
+                target_worker_id="",
+                route_policy=RoutePolicy.SEND_ANYWAY,
+                route_status="GROUP_DISPATCH",
+                start_ts=dispatch_started_at,
+                end_ts=int(time.time() * 1000),
             )
 
             dispatched.append(
@@ -781,3 +941,69 @@ class AgentContext:
             await asyncio.sleep(0.1)
 
         return results
+
+    @property
+    def langfuse_callback(self) -> Optional[Any]:
+        """Return the Langfuse CallbackHandler bound to the current context.
+
+        Returns:
+            A langfuse.langchain.CallbackHandler instance, or None when disabled or
+            unavailable.
+        """
+        try:
+            import os
+            from importlib import import_module
+
+            from by_framework.observability.span_recorder import (
+                str_to_uint64,
+                str_to_uint128,
+            )
+
+            def clean(val):
+                return val.strip().strip("'\"“”‘’") if val else ""
+
+            enabled = clean(os.environ.get("BYAI_LANGFUSE_ENABLED", ""))
+            if enabled and enabled.lower() in {"0", "false", "no", "off", "disabled"}:
+                return None
+
+            secret_key = clean(os.environ.get("LANGFUSE_SECRET_KEY", ""))
+            public_key = clean(os.environ.get("LANGFUSE_PUBLIC_KEY", ""))
+            base_url = clean(os.environ.get("LANGFUSE_BASE_URL", ""))
+
+            if secret_key and public_key and base_url:
+                langfuse_module = import_module("langfuse.langchain")
+                callback_handler_cls = getattr(langfuse_module, "CallbackHandler")
+
+                # Prefer the plugin-level root observation for correct nesting.
+                parent_obs = getattr(self, "_langfuse_observation", None)
+                if parent_obs and hasattr(parent_obs, "id") and parent_obs.id:
+                    parent_id = parent_obs.id
+                else:
+                    raw_parent_id = (
+                        f"{self.execution_id}:worker.execute"
+                        if self.execution_id
+                        else f"{self.message_id}:worker.execute"
+                    )
+                    parent_id = f"{str_to_uint64(raw_parent_id):016x}"
+
+                trace_id_hex = f"{str_to_uint128(self.trace_id):032x}"
+
+                try:
+                    return callback_handler_cls(
+                        public_key=public_key,
+                        secret_key=secret_key,
+                        base_url=base_url,
+                        trace_id=trace_id_hex,
+                        parent_observation_id=parent_id,
+                    )
+                except TypeError:
+                    return callback_handler_cls(
+                        public_key=public_key,
+                        secret_key=secret_key,
+                        host=base_url,
+                        trace_id=trace_id_hex,
+                        parent_observation_id=parent_id,
+                    )
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        return None

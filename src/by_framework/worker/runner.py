@@ -6,6 +6,7 @@ Manages message consumption, execution tracking, and worker lifecycle.
 
 import asyncio
 import hashlib
+import time
 import uuid
 from typing import TYPE_CHECKING, Optional
 
@@ -23,6 +24,13 @@ from by_framework.core.protocol.agent_state import TERMINAL_STATES, AgentState
 from by_framework.core.protocol.commands import (
     CancelTaskCommand,
     ReloadPluginsCommand,
+)
+from by_framework.core.protocol.results import AgentTaskResult
+from by_framework.core.registry import ExecutionCompletionFields
+from by_framework.observability.span_recorder import (
+    SpanRecorder,
+    TraceSpan,
+    live_execution_otel_span,
 )
 from by_framework.util.generate_message_id import generate_message_id
 from by_framework.worker.worker import GatewayWorker
@@ -49,6 +57,7 @@ class WorkerRunner:
         group_name: str = RedisKeys.CG_AGENT_ENGINES,
         max_concurrency: int = 50,
         fetch_count: int = 10,
+        span_recorder: Optional[SpanRecorder] = None,
     ):
         if (
             worker is None
@@ -62,6 +71,12 @@ class WorkerRunner:
         self.consumer_name = worker.worker_id
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.fetch_count = fetch_count
+        # OTel for worker.execute is emitted via a live wrapping span (see
+        # _process_message_from_dict); this recorder only feeds the Redis
+        # dashboard, so disable its own OTel exporter to avoid double export.
+        self.span_recorder = span_recorder or SpanRecorder(
+            self.redis, enable_otel=False
+        )
         self._lock_token = None
         self._heartbeat_task = None
         self._control_task = None
@@ -371,20 +386,89 @@ class WorkerRunner:
                         }
                     )
 
-            # Process command
-            task_result = await self.worker._handle_message(
-                command,
-                cancel_event=cancel_event,
-                cancel_reason=cancel_reason,
-                execution=self._tracker.get_execution(execution_id),
-            )
-            final_status = task_result.status
+            # Process command inside a live OTel span so any spans produced
+            # within the agent (e.g. LangGraph/Langfuse LLM calls) nest under
+            # worker.execute via normal OTel context propagation.
+            execution_started_at = int(time.time() * 1000)
+            async with live_execution_otel_span(
+                trace_id=header.trace_id,
+                span_id=f"{execution_id}:worker.execute",
+                parent_span_id=f"{header.message_id}:client.dispatch",
+                operation="worker.execute",
+                attributes={
+                    "component": "worker",
+                    "session_id": header.session_id,
+                    "execution_id": execution_id,
+                    "message_id": header.message_id,
+                    "worker_id": self.worker.worker_id,
+                    "target_agent_type": header.target_agent_type,
+                },
+                start_ts=execution_started_at,
+            ) as execute_span:
+                task_result = await self.worker._handle_message(
+                    command,
+                    cancel_event=cancel_event,
+                    cancel_reason=cancel_reason,
+                    execution=self._tracker.get_execution(execution_id),
+                )
+                execution_finished_at = int(time.time() * 1000)
+                final_status = task_result.status
+                completion_fields = self._build_completion_observability_fields(
+                    task_result
+                )
+                execute_span.set_status(
+                    final_status,
+                    error_message=str(completion_fields.get("error_message", "")),
+                )
 
             # Mark finished
             if registry and hasattr(registry, "mark_execution_finished"):
                 await registry.mark_execution_finished(
-                    execution_id, header.session_id, final_status
+                    execution_id,
+                    header.session_id,
+                    final_status,
+                    completion_fields,
                 )
+
+            # Record Prometheus metrics
+            try:
+                created_at = int((existing_execution or {}).get("created_at", 0) or 0)
+                queue_wait_ms_val = None
+                if created_at > 0 and execution_started_at >= created_at:
+                    queue_wait_ms_val = execution_started_at - created_at
+
+                from by_framework.observability.metrics import \
+                    record_execution_metrics
+
+                record_execution_metrics(
+                    status=final_status,
+                    agent_type=header.target_agent_type,
+                    worker_id=self.worker.worker_id,
+                    execution_ms=max(
+                        0.0, float(execution_finished_at - execution_started_at)
+                    ),
+                    queue_wait_ms_val=float(queue_wait_ms_val)
+                    if queue_wait_ms_val is not None
+                    else None,
+                )
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logger.debug("Failed to record execution metrics: %s", e)
+
+            await self._record_worker_execute_span(
+                trace_id=header.trace_id,
+                execution_id=execution_id,
+                message_id=header.message_id,
+                parent_message_id=header.parent_message_id or "",
+                session_id=header.session_id,
+                worker_id=self.worker.worker_id,
+                target_agent_type=header.target_agent_type,
+                status=final_status,
+                completion_fields=completion_fields,
+                route_policy=str((existing_execution or {}).get("route_policy", "")),
+                route_status=str((existing_execution or {}).get("route_status", "")),
+                start_ts=execution_started_at,
+                end_ts=execution_finished_at,
+            )
 
             await self.redis.xack(stream_name, self.group_name, msg_id)
             logger.info("[%s] Message processed: %s", self.worker.worker_id, msg_id)
@@ -398,6 +482,72 @@ class WorkerRunner:
             # Clean up tracking
             message_id = data_dict.get("header", {}).get("message_id", "")
             self._tracker.remove_by_message(message_id)
+
+    @staticmethod
+    def _build_completion_observability_fields(
+        task_result: AgentTaskResult,
+    ) -> ExecutionCompletionFields:
+        """Extract structured terminal metadata for execution observability."""
+        fields: ExecutionCompletionFields = {}
+        metadata = task_result.metadata or {}
+        for key in ("error_type", "error_message", "error_code", "failed_stage"):
+            value = metadata.get(key)
+            if value:
+                fields[key] = value  # type: ignore[literal-required]
+        if "retryable" in metadata:
+            fields["retryable"] = bool(metadata["retryable"])
+
+        if "error_message" not in fields and isinstance(task_result.reply_data, dict):
+            error = task_result.reply_data.get("error")
+            if error:
+                fields["error_message"] = str(error)
+        return fields
+
+    async def _record_worker_execute_span(
+        self,
+        *,
+        trace_id: str,
+        execution_id: str,
+        message_id: str,
+        parent_message_id: str,
+        session_id: str,
+        worker_id: str,
+        target_agent_type: str,
+        status: str,
+        completion_fields: ExecutionCompletionFields,
+        route_policy: str,
+        route_status: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> None:
+        try:
+            await self.span_recorder.record_span(
+                TraceSpan(
+                    trace_id=trace_id,
+                    span_id=f"{execution_id}:worker.execute",
+                    parent_span_id=f"{message_id}:client.dispatch",
+                    operation="worker.execute",
+                    component="worker",
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    status=status,
+                    session_id=session_id,
+                    execution_id=execution_id,
+                    message_id=message_id,
+                    parent_message_id=parent_message_id,
+                    worker_id=worker_id,
+                    target_agent_type=target_agent_type,
+                    error_type=str(completion_fields.get("error_type", "")),
+                    error_message=str(completion_fields.get("error_message", "")),
+                    error_code=str(completion_fields.get("error_code", "")),
+                    failed_stage=str(completion_fields.get("failed_stage", "")),
+                    retryable=bool(completion_fields.get("retryable", False)),
+                    route_policy=route_policy,
+                    route_status=route_status,
+                )
+            )
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            logger.debug("Failed to record worker execute span: %s", err)
 
     async def start(self):
         """Start the worker runner main loop."""

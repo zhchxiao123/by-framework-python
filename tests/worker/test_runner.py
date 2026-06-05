@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 from by_framework import (
     AgentTaskResult,
@@ -231,6 +231,108 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(worker.registry.save_execution.await_count == 1)
         worker.registry.mark_execution_finished.assert_awaited()
         self.assertTrue(redis_mock.acked)
+
+    async def test_runner_records_worker_execute_span(self):
+        """Processed worker commands write an execution span for trace drilldown."""
+        redis_mock = MockRedisRunner(message_to_return=[])
+        worker = DummyWorker()
+        worker.registry = AsyncMock()
+        worker.registry.get_execution_by_message_id.return_value = {
+            "execution_id": "exec-worker",
+            "message_id": "msg-worker",
+            "session_id": "sess-1",
+            "trace_id": "trace-worker",
+            "parent_message_id": "parent-msg",
+            "target_agent_type": "dummy_agent",
+            "created_at": 100,
+        }
+        span_recorder = AsyncMock()
+
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            span_recorder=span_recorder,
+        )
+        payload = AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-worker",
+                session_id="sess-1",
+                trace_id="trace-worker",
+                target_agent_type="dummy_agent",
+                parent_message_id="parent-msg",
+            ),
+            content="test",
+        ).to_dict()
+
+        await runner._process_message_from_dict(
+            RedisKeys.ctrl_stream("dummy_agent"), "1-0", payload
+        )
+
+        span_recorder.record_span.assert_awaited_once()
+        span = span_recorder.record_span.await_args.args[0]
+        self.assertEqual(span.trace_id, "trace-worker")
+        self.assertEqual(span.span_id, "exec-worker:worker.execute")
+        self.assertEqual(span.parent_span_id, "msg-worker:client.dispatch")
+        self.assertEqual(span.operation, "worker.execute")
+        self.assertEqual(span.component, "worker")
+        self.assertEqual(span.session_id, "sess-1")
+        self.assertEqual(span.execution_id, "exec-worker")
+        self.assertEqual(span.message_id, "msg-worker")
+        self.assertEqual(span.parent_message_id, "parent-msg")
+        self.assertEqual(span.worker_id, "worker-1")
+        self.assertEqual(span.target_agent_type, "dummy_agent")
+        self.assertEqual(span.status, AgentState.COMPLETED.value)
+
+    async def test_runner_persists_structured_failure_details(self):
+        """Test terminal execution updates include structured failure fields."""
+        redis_mock = MockRedisRunner(message_to_return=[])
+        worker = DummyWorker()
+        worker.registry = AsyncMock()
+        worker.registry.get_execution_by_message_id.return_value = None
+        worker._handle_message = AsyncMock(
+            return_value=AgentTaskResult(
+                status=AgentState.FAILED.value,
+                reply_data={"error": "boom"},
+                metadata={
+                    "error_type": "RuntimeError",
+                    "error_message": "boom",
+                    "error_code": "E_BOOM",
+                    "failed_stage": "process_command",
+                    "retryable": False,
+                },
+            )
+        )
+
+        runner = WorkerRunner(
+            redis_client=redis_mock, worker=worker, group_name="test_group"
+        )
+        payload = AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-failed",
+                session_id="sess-1",
+                trace_id="trace-1",
+                target_agent_type="dummy_agent",
+            ),
+            content="test",
+        ).to_dict()
+
+        await runner._process_message_from_dict(
+            RedisKeys.ctrl_stream("dummy_agent"), "1-0", payload
+        )
+
+        worker.registry.mark_execution_finished.assert_awaited_once_with(
+            ANY,
+            "sess-1",
+            AgentState.FAILED.value,
+            {
+                "error_type": "RuntimeError",
+                "error_message": "boom",
+                "error_code": "E_BOOM",
+                "failed_stage": "process_command",
+                "retryable": False,
+            },
+        )
 
     async def test_runner_treats_existing_queued_execution_as_new_request(self):
         """Test sender-created QUEUED executions are not treated as resumes."""

@@ -47,6 +47,39 @@ async def test_client_send_message_with_target_worker_id():
 
 
 @pytest.mark.asyncio
+async def test_client_send_message_records_client_dispatch_span():
+    """Successful client dispatch writes a trace span for end-to-end visibility."""
+    mock_redis = AsyncMock()
+    mock_registry = AsyncMock()
+    span_recorder = AsyncMock()
+
+    client = GatewayClient(
+        redis_client=mock_redis,
+        registry=mock_registry,
+        span_recorder=span_recorder,
+    )
+    await client.send_message(
+        target_agent_type="langgraph_agent",
+        session_id="s1",
+        content="hello",
+        target_worker_id="worker-42",
+        message_id="msg-client",
+        trace_id="trace-client",
+    )
+
+    span_recorder.record_span.assert_awaited_once()
+    span = span_recorder.record_span.await_args.args[0]
+    assert span.trace_id == "trace-client"
+    assert span.span_id == "msg-client:client.dispatch"
+    assert span.operation == "client.dispatch"
+    assert span.component == "client"
+    assert span.session_id == "s1"
+    assert span.message_id == "msg-client"
+    assert span.target_agent_type == "langgraph_agent"
+    assert span.status == "COMPLETED"
+
+
+@pytest.mark.asyncio
 async def test_resolve_direct_worker_route():
     """Test that direct worker routing returns an explicit worker stream
     and worker id."""
@@ -230,6 +263,13 @@ async def test_client_send_message_fail_fast_no_worker():
     mock_redis.xadd.assert_not_called()
     # Should call has_online_agent_type
     mock_registry.has_online_agent_type.assert_called_once_with("nonexistent_agent")
+    # Route failures should be recorded for observability.
+    mock_registry.record_failed_route_decision.assert_awaited_once()
+    call_kwargs = mock_registry.record_failed_route_decision.await_args.kwargs
+    assert call_kwargs["route_policy"] == RoutePolicy.FAIL_FAST
+    assert call_kwargs["route_status"] == "REJECT"
+    assert call_kwargs["availability_error_code"] == "AGENT_TYPE_UNAVAILABLE"
+    assert call_kwargs["source_agent_type"] == "client"
 
 
 @pytest.mark.asyncio

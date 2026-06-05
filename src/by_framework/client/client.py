@@ -18,6 +18,7 @@ from by_framework.common.constants import (
     MESSAGE_ID_PREFIX,
     RedisKeys,
 )
+from by_framework.common.logger import logger
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.availability import (
     AvailabilityRouter,
@@ -42,6 +43,7 @@ from by_framework.core.protocol.responses import (
 )
 from by_framework.core.registry import WorkerRegistry
 from by_framework.errors import WorkerRegistryNotSetError
+from by_framework.observability.span_recorder import SpanRecorder, TraceSpan
 
 if TYPE_CHECKING:
     pass
@@ -86,12 +88,14 @@ class GatewayClient:
         registry: Optional[WorkerRegistry] = None,
         redis_client: Optional[Redis] = None,
         interceptors: Optional[List[GatewayInterceptor]] = None,
+        span_recorder: Optional[SpanRecorder] = None,
     ):
         self.registry = registry
         self.redis = (
             redis_client or (registry.redis if registry else None) or get_redis()
         )
         self.interceptors = interceptors or []
+        self.span_recorder = span_recorder or SpanRecorder(self.redis)
 
     def add_interceptor(self, interceptor: GatewayInterceptor):
         self.interceptors.append(interceptor)
@@ -651,6 +655,24 @@ class GatewayClient:
                     AvailabilityStatus.FALLBACK_TO_OTHER_AGENT_TYPE,
                     AvailabilityStatus.QUEUE_PENDING,
                 ):
+                    if self.registry and hasattr(
+                        self.registry, "record_failed_route_decision"
+                    ):
+                        await self.registry.record_failed_route_decision(
+                            execution_id=execution_id,
+                            message_id=message_id,
+                            session_id=params["session_id"],
+                            trace_id=trace_id,
+                            target_agent_type=params["target_agent_type"],
+                            parent_message_id=params["parent_message_id"] or "",
+                            source_agent_type="client",
+                            route_policy=route_policy,
+                            route_status=availability.status,
+                            stream_name=availability.stream_name or "",
+                            selected_agent_type=availability.selected_agent_type or "",
+                            availability_error_code=availability.error_code or "",
+                            availability_error=availability.error or "",
+                        )
                     return SendMessageResponse(
                         success=False,
                         status=ExecutionStatus.FAILED,
@@ -708,14 +730,42 @@ class GatewayClient:
                         "target_agent_type": params["target_agent_type"],
                         "stream_name": route.stream_name,
                         "status": "QUEUED",
+                        "route_policy": route_policy,
+                        "route_status": availability.status
+                        if not target_worker_id
+                        else "DIRECT_WORKER",
+                        "selected_agent_type": availability.selected_agent_type
+                        if not target_worker_id
+                        else "",
+                        "availability_error_code": availability.error_code
+                        if not target_worker_id
+                        else "",
+                        "availability_error": availability.error
+                        if not target_worker_id
+                        else "",
                     }
                 )
             except Exception:  # pylint: disable=broad-exception-caught
                 pass  # Fallback if registry fails
 
         # 4. Route to the appropriate stream
+        dispatch_started_at = int(time.time() * 1000)
         if should_dispatch_control:
             await self.redis.xadd(route.stream_name, command.to_redis_payload())
+        await self._record_client_dispatch_span(
+            trace_id=trace_id,
+            message_id=message_id,
+            session_id=params["session_id"],
+            parent_message_id=params["parent_message_id"] or "",
+            target_agent_type=params["target_agent_type"],
+            target_worker_id=route.target_worker_id,
+            route_policy=route_policy,
+            route_status=availability.status
+            if not target_worker_id
+            else "DIRECT_WORKER",
+            start_ts=dispatch_started_at,
+            end_ts=int(time.time() * 1000),
+        )
 
         return SendMessageResponse(
             success=True,
@@ -725,3 +775,52 @@ class GatewayClient:
             timestamp=int(time.time() * 1000),
             status=ExecutionStatus.QUEUED,
         )
+
+    async def _record_client_dispatch_span(
+        self,
+        *,
+        trace_id: str,
+        message_id: str,
+        session_id: str,
+        parent_message_id: str,
+        target_agent_type: str,
+        target_worker_id: str,
+        route_policy: str,
+        route_status: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> None:
+        try:
+            logger.info(
+                "Recording client dispatch span: message_id=%s, trace_id=%s",
+                message_id,
+                trace_id,
+            )
+            await self.span_recorder.record_span(
+                TraceSpan(
+                    trace_id=trace_id,
+                    span_id=f"{message_id}:client.dispatch",
+                    parent_span_id="",
+                    operation="client.dispatch",
+                    component="client",
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    status="COMPLETED",
+                    session_id=session_id,
+                    message_id=message_id,
+                    parent_message_id=parent_message_id,
+                    worker_id=target_worker_id,
+                    source_agent_type="client",
+                    target_agent_type=target_agent_type,
+                    route_policy=route_policy,
+                    route_status=route_status,
+                )
+            )
+            logger.info(
+                "Client dispatch span recorded successfully for message_id=%s",
+                message_id,
+            )
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "Failed to record client dispatch span: %s", err, exc_info=True
+            )

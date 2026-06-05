@@ -48,7 +48,7 @@ from by_framework.core.protocol.results import (
 )
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.runtime.filestore.base import FileStorage
-from by_framework.worker.context import AgentContext
+from by_framework.worker.context import AgentContext, current_agent_context_var
 from by_framework.worker.heartbeat import WorkerHeartbeat
 
 from .sandbox.hook_sandbox import active_workspace
@@ -449,6 +449,7 @@ class GatewayWorker(ABC):
             content_codec=self.get_content_codec(),
             layout_builder=self.get_data_layout_builder(),
             is_sub_agent=has_source_agent,
+            execution_id=execution.execution_id if execution else "",
         )
         if execution:
             execution.context = context
@@ -465,6 +466,7 @@ class GatewayWorker(ABC):
         )
         logger.info("[%s] Session ID: %s", self.worker_id, header.session_id)
 
+        ctx_token = current_agent_context_var.set(context)
         token = None
         try:
             # Call plugin hooks at task start
@@ -695,8 +697,17 @@ class GatewayWorker(ABC):
             else:
                 await context.flush_to_history()
 
-            return AgentTaskResult(status=AgentState.FAILED.value)
+            return AgentTaskResult(
+                status=AgentState.FAILED.value,
+                reply_data={"error": str(e)},
+                metadata={
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "failed_stage": "process_command",
+                },
+            )
         finally:
+            current_agent_context_var.reset(ctx_token)
             # 4. Cleanup
             if token is not None:
                 active_workspace.reset(token)

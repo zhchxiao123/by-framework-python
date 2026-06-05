@@ -134,7 +134,8 @@ async def test_langfuse_plugin_starts_observation_and_persists_mapping():
 
     # Two native observations are created: worker.execute, then the agent task.
     assert len(tracer.start_calls) == 2
-    worker_execute_call, agent_call = tracer.start_calls
+    worker_execute_call = tracer.start_calls[0]
+    agent_call = tracer.start_calls[1]
 
     # worker.execute hangs under the parent task (store lookup for sub-agents).
     assert worker_execute_call["name"] == "worker.execute"
@@ -170,9 +171,11 @@ async def test_langfuse_plugin_top_level_nests_under_worker_execute():
     await plugin.on_task_start(context)
 
     assert len(tracer.start_calls) == 2
-    worker_execute_call, agent_call = tracer.start_calls
+    worker_execute_call = tracer.start_calls[0]
+    agent_call = tracer.start_calls[1]
 
-    client_dispatch_id = f"{str_to_uint64('msg-1:client.dispatch'):016x}"
+    client_dispatch_val = str_to_uint64("msg-1:client.dispatch")
+    client_dispatch_id = f"{client_dispatch_val:016x}"
     worker_execute_span_id = str_to_uint64("msg-1:worker.execute")
     agent_task_span_id = str_to_uint64("msg-1:agent.task")
 

@@ -264,6 +264,7 @@ class TestAdapterRun:
         """Verify AgentContext.langfuse_callback property values are not called."""
         handler = object()
 
+        # pylint: disable=too-few-public-methods,missing-class-docstring,missing-function-docstring
         class ContextWithCallbackProperty:
             session_id = "test-session"
             trace_id = "trace-ctx"
@@ -279,12 +280,14 @@ class TestAdapterRun:
                 )
             )
 
+            def __init__(self):
+                self.emit_chunk = AsyncMock()
+
             @property
             def langfuse_callback(self):
                 return handler
 
         ctx = ContextWithCallbackProperty()
-        ctx.emit_chunk = AsyncMock()
         graph = MagicMock()
         graph.ainvoke = AsyncMock(
             return_value={"messages": [MagicMock(content="hello")]}

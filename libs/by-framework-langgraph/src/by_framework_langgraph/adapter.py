@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, Callable, Iterator
+from unittest.mock import Mock
 
 from by_framework.common.logger import logger
 from by_framework.core.protocol.agent_state import AgentState
@@ -388,12 +389,7 @@ class LangGraphAdapter:
         langfuse_callback_value = getattr(self._context, "langfuse_callback", None)
         is_real_callback = False
         if langfuse_callback_value is not None:
-            try:
-                from unittest.mock import Mock
-
-                is_real_callback = not isinstance(langfuse_callback_value, Mock)
-            except ImportError:
-                is_real_callback = True
+            is_real_callback = not isinstance(langfuse_callback_value, Mock)
 
         if is_real_callback:
             handler = (
@@ -444,7 +440,7 @@ class LangGraphAdapter:
                 current_span = trace.get_current_span()
                 if current_span and hasattr(current_span, "set_attribute"):
                     current_span.set_attribute("langfuse.internal.as_root", False)
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 pass
             yield
 

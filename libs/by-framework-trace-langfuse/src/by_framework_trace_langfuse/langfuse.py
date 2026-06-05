@@ -14,6 +14,13 @@ from by_framework.core.extensions import (
     TraceProviderFactory,
 )
 from by_framework.core.registry import WorkerRegistry
+from by_framework.observability.span_recorder import (
+    configure_otel_id_generator,
+    current_span_id_var,
+    current_trace_id_var,
+    str_to_uint64,
+    str_to_uint128,
+)
 
 LANGFUSE_OBSERVATION_ATTR = "_langfuse_observation"
 WORKER_EXECUTE_OBSERVATION_ATTR = "_langfuse_worker_execute_observation"
@@ -163,13 +170,6 @@ class _SdkLangfuseTracer:
 
     def start_observation(self, request: _ObservationStartRequest) -> ObservationHandle:
         """Start a Langfuse observation with the current framework trace context."""
-        from by_framework.observability.span_recorder import (
-            configure_otel_id_generator,
-            current_span_id_var,
-            current_trace_id_var,
-            str_to_uint128,
-        )
-
         trace_context = {"trace_id": request.trace_id}
         if request.parent_observation_id:
             trace_context["parent_span_id"] = request.parent_observation_id
@@ -197,6 +197,7 @@ class _SdkLangfuseTracer:
         else:
             obs = self._client.start_observation(**kwargs)
 
+        # pylint: disable=protected-access
         if (
             obs is not None
             and hasattr(obs, "_otel_span")
@@ -204,7 +205,7 @@ class _SdkLangfuseTracer:
         ):
             try:
                 obs._otel_span.set_attribute("langfuse.internal.as_root", False)
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 pass
 
         return obs
@@ -259,11 +260,6 @@ class LangfusePlugin(Plugin):
         tracer = self._get_tracer()
         observation_store = self._get_observation_store(context)
         identity = self._build_task_identity(context)
-
-        from by_framework.observability.span_recorder import (
-            str_to_uint64,
-            str_to_uint128,
-        )
 
         trace_id_hex = f"{str_to_uint128(identity.trace_id):032x}"
 

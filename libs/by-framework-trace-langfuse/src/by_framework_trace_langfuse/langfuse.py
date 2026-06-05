@@ -16,6 +16,7 @@ from by_framework.core.extensions import (
 from by_framework.core.registry import WorkerRegistry
 
 LANGFUSE_OBSERVATION_ATTR = "_langfuse_observation"
+WORKER_EXECUTE_OBSERVATION_ATTR = "_langfuse_worker_execute_observation"
 _QUOTES_TO_STRIP = "\"'“”‘’"
 _FALSE_LIKE_VALUES = {"0", "false", "no", "off", "disabled"}
 
@@ -114,6 +115,7 @@ class _ObservationStartRequest:
     observation_input: Any
     metadata: dict[str, Any]
     parent_observation_id: str = ""
+    span_id: Optional[int] = None
 
 
 class WorkerRegistryObservationStore:
@@ -161,17 +163,51 @@ class _SdkLangfuseTracer:
 
     def start_observation(self, request: _ObservationStartRequest) -> ObservationHandle:
         """Start a Langfuse observation with the current framework trace context."""
+        from by_framework.observability.span_recorder import (
+            configure_otel_id_generator,
+            current_span_id_var,
+            current_trace_id_var,
+            str_to_uint128,
+        )
+
         trace_context = {"trace_id": request.trace_id}
         if request.parent_observation_id:
             trace_context["parent_span_id"] = request.parent_observation_id
 
-        return self._client.start_observation(
-            trace_context=trace_context,
-            name=request.name,
-            as_type="agent",
-            input=request.observation_input,
-            metadata=request.metadata,
-        )
+        kwargs = {
+            "trace_context": trace_context,
+            "name": request.name,
+            "as_type": "agent",
+            "input": request.observation_input,
+            "metadata": request.metadata,
+        }
+
+        configure_otel_id_generator()
+
+        obs = None
+        if request.span_id is not None:
+            trace_id_int = str_to_uint128(request.trace_id)
+            trace_id_token = current_trace_id_var.set(trace_id_int)
+            span_id_token = current_span_id_var.set(request.span_id)
+            try:
+                obs = self._client.start_observation(**kwargs)
+            finally:
+                current_trace_id_var.reset(trace_id_token)
+                current_span_id_var.reset(span_id_token)
+        else:
+            obs = self._client.start_observation(**kwargs)
+
+        if (
+            obs is not None
+            and hasattr(obs, "_otel_span")
+            and obs._otel_span is not None
+        ):
+            try:
+                obs._otel_span.set_attribute("langfuse.internal.as_root", False)
+            except Exception:
+                pass
+
+        return obs
 
     def shutdown(self) -> None:
         """Flush tracing state using whichever shutdown API the SDK exposes."""
@@ -224,27 +260,68 @@ class LangfusePlugin(Plugin):
         observation_store = self._get_observation_store(context)
         identity = self._build_task_identity(context)
 
-        parent_observation_id = ""
+        from by_framework.observability.span_recorder import (
+            str_to_uint64,
+            str_to_uint128,
+        )
+
+        trace_id_hex = f"{str_to_uint128(identity.trace_id):032x}"
+
+        # The worker process needs a concrete worker.execute node. Langfuse's
+        # default span filter can drop native by-framework OTel spans, so create a
+        # native Langfuse observation for worker.execute and nest the agent task
+        # below it to restore the client.dispatch -> worker.execute -> agent -> LLM
+        # chain.
+        execution_anchor = (
+            context.execution_id
+            if getattr(context, "execution_id", None)
+            else context.message_id
+        )
+        command_input = self._serialize_value(
+            getattr(context.current_command, "content", None)
+        )
+        metadata = self._build_metadata(identity, context)
+
+        # Parent worker.execute to client.dispatch for top-level tasks. For child
+        # agents, parent to the stored observation id of the calling task.
         if identity.parent_message_id:
-            parent_observation_id = (
+            worker_execute_parent = (
                 await observation_store.get_observation_id(
                     identity.session_id, identity.parent_message_id
                 )
                 or ""
             )
+        else:
+            worker_execute_parent = (
+                f"{str_to_uint64(f'{identity.message_id}:client.dispatch'):016x}"
+            )
+
+        worker_execute_obs = tracer.start_observation(
+            _ObservationStartRequest(
+                span_id=str_to_uint64(f"{execution_anchor}:worker.execute"),
+                trace_id=trace_id_hex,
+                parent_observation_id=worker_execute_parent,
+                name="worker.execute",
+                observation_input=command_input,
+                metadata=metadata,
+            )
+        )
 
         observation = tracer.start_observation(
             _ObservationStartRequest(
-                trace_id=identity.trace_id,
-                parent_observation_id=parent_observation_id,
+                span_id=str_to_uint64(f"{execution_anchor}:agent.task"),
+                trace_id=trace_id_hex,
+                parent_observation_id=worker_execute_obs.id,
                 name=identity.agent_id,
-                observation_input=self._serialize_value(
-                    getattr(context.current_command, "content", None)
-                ),
-                metadata=self._build_metadata(identity, context),
+                observation_input=command_input,
+                metadata=metadata,
             )
         )
+
         setattr(context, LANGFUSE_OBSERVATION_ATTR, observation)
+        setattr(context, WORKER_EXECUTE_OBSERVATION_ATTR, worker_execute_obs)
+        # Child agents resolve this task through parent_message_id and nest under
+        # agent.task.
         await observation_store.set_observation_id(
             identity.session_id, identity.message_id, observation.id
         )
@@ -253,23 +330,25 @@ class LangfusePlugin(Plugin):
         self._end_observation(context, output=self._serialize_value(result))
 
     async def on_task_error(self, context: Any, error: Exception) -> None:
-        observation = self._get_context_observation(context)
-        if observation is None:
+        observations = self._iter_context_observations(context)
+        if not observations:
             return
 
-        observation.update(level="ERROR", status_message=str(error))
+        for observation in observations:
+            observation.update(level="ERROR", status_message=str(error))
         self._end_observation(
             context,
             output={"error": str(error)},
         )
 
     async def on_task_cancel(self, context: Any, command: Any) -> None:
-        observation = self._get_context_observation(context)
-        if observation is None:
+        observations = self._iter_context_observations(context)
+        if not observations:
             return
 
         reason = getattr(command, "reason", "") or "cancelled"
-        observation.update(level="WARNING", status_message=reason)
+        for observation in observations:
+            observation.update(level="WARNING", status_message=reason)
         self._end_observation(
             context,
             output={"cancelled": True, "reason": reason},
@@ -378,17 +457,24 @@ class LangfusePlugin(Plugin):
             return None
         return observation
 
-    def _end_observation(self, context: Any, *, output: Any) -> None:
-        observation = self._get_context_observation(context)
-        if observation is None:
-            return
+    @staticmethod
+    def _iter_context_observations(context: Any) -> list[ObservationHandle]:
+        """Return the agent task and worker.execute observations, innermost first."""
+        observations: list[ObservationHandle] = []
+        for attr in (LANGFUSE_OBSERVATION_ATTR, WORKER_EXECUTE_OBSERVATION_ATTR):
+            observation = getattr(context, attr, None)
+            if observation is not None:
+                observations.append(observation)
+        return observations
 
+    def _end_observation(self, context: Any, *, output: Any) -> None:
         serialized_output = self._serialize_value(output)
-        try:
-            observation.end(output=serialized_output)
-        except TypeError:
-            observation.update(output=serialized_output)
-            observation.end()
+        for observation in self._iter_context_observations(context):
+            try:
+                observation.end(output=serialized_output)
+            except TypeError:
+                observation.update(output=serialized_output)
+                observation.end()
 
 
 class LangfuseTraceProviderFactory(TraceProviderFactory):

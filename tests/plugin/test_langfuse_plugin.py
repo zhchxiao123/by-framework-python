@@ -47,6 +47,7 @@ class FakeTracer:
                 "observation_input": request.observation_input,
                 "metadata": request.metadata,
                 "parent_observation_id": request.parent_observation_id,
+                "span_id": request.span_id,
             }
         )
         return FakeObservation(id=f"obs-{len(self.start_calls)}")
@@ -91,7 +92,7 @@ def _build_context(
     *,
     message_id: str = "msg-1",
     parent_message_id: str = "",
-    trace_id: str = "trace-1",
+    trace_id: str = "12345678901234567890123456789012",
     session_id: str = "session-1",
     current_agent_id: str = "planner",
     content: Any = "hello",
@@ -131,14 +132,59 @@ async def test_langfuse_plugin_starts_observation_and_persists_mapping():
 
     await plugin.on_task_start(context)
 
-    assert len(tracer.start_calls) == 1
-    start_call = tracer.start_calls[0]
-    assert start_call["trace_id"] == "trace-1"
-    assert start_call["parent_observation_id"] == "obs-parent"
-    assert start_call["name"] == "planner"
-    assert start_call["input"] == "hello"
-    assert start_call["metadata"]["message_id"] == "msg-child"
-    assert store.mapping[("session-1", "msg-child")] == "obs-1"
+    # Two native observations are created: worker.execute, then the agent task.
+    assert len(tracer.start_calls) == 2
+    worker_execute_call, agent_call = tracer.start_calls
+
+    # worker.execute hangs under the parent task (store lookup for sub-agents).
+    assert worker_execute_call["name"] == "worker.execute"
+    assert worker_execute_call["parent_observation_id"] == "obs-parent"
+    assert worker_execute_call["trace_id"] == "12345678901234567890123456789012"
+
+    # The agent task nests under this execution's worker.execute observation.
+    assert agent_call["name"] == "planner"
+    assert agent_call["parent_observation_id"] == "obs-1"  # worker.execute obs id
+    assert agent_call["input"] == "hello"
+    assert agent_call["metadata"]["message_id"] == "msg-child"
+    # The agent task observation id is what children look up as their parent.
+    assert store.mapping[("session-1", "msg-child")] == "obs-2"
+
+
+@pytest.mark.asyncio
+async def test_langfuse_plugin_top_level_nests_under_worker_execute():
+    """Top-level chain: client.dispatch -> worker.execute -> agent task.
+
+    Regression: worker.execute is materialised as a native Langfuse observation
+    so it reliably appears (raw by-framework OTel spans are dropped by Langfuse's
+    default filter in the worker process); the agent task nests under it, and
+    worker.execute itself parents to client.dispatch.
+    """
+    from by_framework.observability.span_recorder import str_to_uint64
+
+    tracer = FakeTracer()
+    store = FakeObservationStore()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=store)
+    # No execution_id on the context -> anchor falls back to message_id.
+    context = _build_context(message_id="msg-1", parent_message_id="")
+
+    await plugin.on_task_start(context)
+
+    assert len(tracer.start_calls) == 2
+    worker_execute_call, agent_call = tracer.start_calls
+
+    client_dispatch_id = f"{str_to_uint64('msg-1:client.dispatch'):016x}"
+    worker_execute_span_id = str_to_uint64("msg-1:worker.execute")
+    agent_task_span_id = str_to_uint64("msg-1:agent.task")
+
+    # worker.execute is its own node, parented to client.dispatch.
+    assert worker_execute_call["name"] == "worker.execute"
+    assert worker_execute_call["span_id"] == worker_execute_span_id
+    assert worker_execute_call["parent_observation_id"] == client_dispatch_id
+
+    # Agent task nests under worker.execute, with a distinct span id.
+    assert agent_call["span_id"] == agent_task_span_id
+    assert agent_call["span_id"] != worker_execute_span_id
+    assert agent_call["parent_observation_id"] == "obs-1"  # worker.execute obs id
 
 
 @pytest.mark.asyncio

@@ -260,6 +260,47 @@ class TestAdapterRun:
         assert observation_calls[0]["name"] == "planner:langgraph"
 
     @pytest.mark.asyncio
+    async def test_uses_context_langfuse_callback_property(self):
+        """Verify AgentContext.langfuse_callback property values are not called."""
+        handler = object()
+
+        class ContextWithCallbackProperty:
+            session_id = "test-session"
+            trace_id = "trace-ctx"
+            message_id = "msg-ctx"
+            parent_message_id = ""
+            current_agent_id = "planner"
+            current_command = SimpleNamespace(
+                header=MessageHeader(
+                    message_id="msg-ctx",
+                    session_id="test-session",
+                    trace_id="trace-ctx",
+                    target_agent_type="planner",
+                )
+            )
+
+            @property
+            def langfuse_callback(self):
+                return handler
+
+        ctx = ContextWithCallbackProperty()
+        ctx.emit_chunk = AsyncMock()
+        graph = MagicMock()
+        graph.ainvoke = AsyncMock(
+            return_value={"messages": [MagicMock(content="hello")]}
+        )
+        snapshot = MagicMock()
+        snapshot.next = ()
+        graph.get_state.return_value = snapshot
+
+        adapter = LangGraphAdapter(graph, ctx, stream=False)
+        result = await adapter.run(AskAgentCommand(header=_make_header(), content="hi"))
+
+        assert result == "hello"
+        _, kwargs = graph.ainvoke.call_args
+        assert kwargs["config"]["callbacks"] == [handler]
+
+    @pytest.mark.asyncio
     async def test_skips_langfuse_tracing_silently_when_not_configured(
         self, monkeypatch, caplog
     ):

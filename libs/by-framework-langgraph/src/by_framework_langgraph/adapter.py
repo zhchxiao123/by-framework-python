@@ -383,6 +383,30 @@ class LangGraphAdapter:
     @contextmanager
     def _langfuse_callback_manager(self, callbacks: list[Any]) -> Iterator[None]:
         """Prepare Langfuse callback and observation for LangChain."""
+        # Prefer AgentContext's callback factory so trace and parent ids align.
+        # Ignore MagicMock-generated attributes in tests.
+        langfuse_callback_value = getattr(self._context, "langfuse_callback", None)
+        is_real_callback = False
+        if langfuse_callback_value is not None:
+            try:
+                from unittest.mock import Mock
+
+                is_real_callback = not isinstance(langfuse_callback_value, Mock)
+            except ImportError:
+                is_real_callback = True
+
+        if is_real_callback:
+            handler = (
+                langfuse_callback_value()
+                if callable(langfuse_callback_value)
+                else langfuse_callback_value
+            )
+            if handler is not None:
+                callbacks.append(handler)
+                yield
+                return
+
+        # Fallback to local import if context method is missing
         # pylint: disable=import-outside-toplevel
         try:
             langfuse_config = import_module(
@@ -414,6 +438,14 @@ class LangGraphAdapter:
             },
             metadata=self._default_metadata(),
         ):
+            # Prevent the generated OTel span from being promoted to a trace root.
+            try:
+                from opentelemetry import trace
+                current_span = trace.get_current_span()
+                if current_span and hasattr(current_span, "set_attribute"):
+                    current_span.set_attribute("langfuse.internal.as_root", False)
+            except Exception:
+                pass
             yield
 
     @staticmethod

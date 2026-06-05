@@ -56,9 +56,19 @@ def extract_resume_data(command: ResumeCommand) -> str:
 
 def str_to_uint128(s: str) -> int:
     """Convert a string to a 128-bit integer (for OTEL TraceId)."""
+    if len(s) == 32:
+        try:
+            return int(s, 16)
+        except ValueError:
+            pass
     return int(hashlib.md5(s.encode()).hexdigest(), 16)
 
 
 def str_to_uint64(s: str) -> int:
     """Convert a string to a 64-bit integer (for OTEL SpanId)."""
+    if len(s) == 16:
+        try:
+            return int(s, 16)
+        except ValueError:
+            pass
     return int(hashlib.md5(s.encode()).hexdigest()[:16], 16)

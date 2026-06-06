@@ -437,6 +437,7 @@ class LangGraphAdapter:
             # Prevent the generated OTel span from being promoted to a trace root.
             try:
                 from opentelemetry import trace
+
                 current_span = trace.get_current_span()
                 if current_span and hasattr(current_span, "set_attribute"):
                     current_span.set_attribute("langfuse.internal.as_root", False)

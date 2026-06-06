@@ -437,8 +437,7 @@ class WorkerRunner:
                 if created_at > 0 and execution_started_at >= created_at:
                     queue_wait_ms_val = execution_started_at - created_at
 
-                from by_framework.observability.metrics import \
-                    record_execution_metrics
+                from by_framework.observability.metrics import record_execution_metrics
 
                 record_execution_metrics(
                     status=final_status,

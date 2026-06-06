@@ -9,8 +9,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from inspect import isawaitable
-from typing import (Any, AsyncIterator, Optional, Protocol, Sequence,
-                    runtime_checkable)
+from typing import (Any, AsyncIterator, Optional, Protocol, Sequence, runtime_checkable)
 
 from by_framework.common.constants import RedisKeys
 from by_framework.common.logger import logger
@@ -574,8 +573,7 @@ class SpanRecorder:
         else:
             self.exporters = [RedisSpanExporter(redis_client, ttl_seconds=ttl_seconds)]
             try:
-                from opentelemetry import \
-                    trace  # pylint: disable=unused-import
+                from opentelemetry import trace  # pylint: disable=unused-import
 
                 if trace is not None:
                     self.exporters.append(OTelSpanExporter())

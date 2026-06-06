@@ -14,11 +14,8 @@ import uuid
 import warnings
 from typing import Any, List, Optional, TypedDict
 
-from by_framework.common.constants import (
-    EXEC_FIELD_PREFIX,
-    MSG_MAP_PREFIX,
-    RedisKeys,
-)
+from by_framework.common.constants import (EXEC_FIELD_PREFIX, MSG_MAP_PREFIX,
+                                           RedisKeys)
 from by_framework.common.exceptions import ExecutionDataError
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.extensions import AgentConfigsSnapshot, PluginRegistry

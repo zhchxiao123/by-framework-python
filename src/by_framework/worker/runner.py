@@ -96,6 +96,15 @@ class WorkerRunner:
         digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
         return f"{RedisKeys.CG_AGENT_ENGINES}:{digest}"
 
+    @staticmethod
+    def _client_dispatch_parent_span_id(header: Any) -> str:
+        """Return the propagated client.dispatch parent span id for a command."""
+        parent_span_id = str(getattr(header, "trace_parent_span_id", "") or "")
+        if not parent_span_id:
+            metadata = getattr(header, "metadata", {}) or {}
+            parent_span_id = str(metadata.get("trace_parent_span_id", "") or "")
+        return parent_span_id or f"{header.message_id}:client.dispatch"
+
     async def setup_streams(self):
         """Set up Redis streams and consumer groups for all agent types."""
         from redis.exceptions import ResponseError
@@ -408,10 +417,13 @@ class WorkerRunner:
             # worker.execute via normal OTel context propagation.
             execution_started_at = int(time.time() * 1000)
             err_start_ts = execution_started_at
+            client_dispatch_parent_span_id = self._client_dispatch_parent_span_id(
+                header
+            )
             async with live_execution_otel_span(
                 trace_id=header.trace_id,
                 span_id=f"{execution_id}:worker.execute",
-                parent_span_id=f"{header.message_id}:client.dispatch",
+                parent_span_id=client_dispatch_parent_span_id,
                 operation="worker.execute",
                 attributes={
                     "component": "worker",
@@ -492,6 +504,7 @@ class WorkerRunner:
                 start_ts=execution_started_at,
                 end_ts=execution_finished_at,
                 chunk_count=chunk_count,
+                parent_span_id=client_dispatch_parent_span_id,
             )
 
             await self.redis.xack(stream_name, self.group_name, msg_id)
@@ -522,6 +535,7 @@ class WorkerRunner:
                         route_status="",
                         start_ts=err_start_ts,
                         end_ts=int(time.time() * 1000),
+                        parent_span_id=self._client_dispatch_parent_span_id(err_header),
                     )
                 except Exception:  # pylint: disable=broad-exception-caught
                     pass
@@ -580,6 +594,7 @@ class WorkerRunner:
         route_status: str,
         start_ts: int,
         end_ts: int,
+        parent_span_id: str = "",
         chunk_count: int = 0,
     ) -> None:
         try:
@@ -587,7 +602,7 @@ class WorkerRunner:
                 TraceSpan(
                     trace_id=trace_id,
                     span_id=f"{execution_id}:worker.execute",
-                    parent_span_id=f"{message_id}:client.dispatch",
+                    parent_span_id=parent_span_id or f"{message_id}:client.dispatch",
                     operation="worker.execute",
                     component="worker",
                     start_ts=start_ts,

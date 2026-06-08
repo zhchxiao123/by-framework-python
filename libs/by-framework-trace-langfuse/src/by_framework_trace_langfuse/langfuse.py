@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import os
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from importlib import import_module
 from typing import Any, Optional, Protocol, runtime_checkable
 
@@ -83,6 +85,9 @@ class LangfuseTracer(Protocol):
 
     def start_observation(self, request: _ObservationStartRequest) -> ObservationHandle:
         """Start a new observation."""
+
+    def update_trace_output(self, trace_id: str, output: Any) -> None:
+        """Update trace-level output shown in Langfuse trace lists."""
 
     def shutdown(self) -> None:
         """Flush and shutdown the tracer."""
@@ -169,8 +174,9 @@ class WorkerRegistryObservationStore:
 class _SdkLangfuseTracer:
     """Langfuse SDK adapter used only when the SDK is installed."""
 
-    def __init__(self, client: Any):
+    def __init__(self, client: Any, config: LangfuseConfig | None = None):
         self._client = client
+        self._config = config
 
     def start_observation(self, request: _ObservationStartRequest) -> ObservationHandle:
         """Start a Langfuse observation with the current framework trace context."""
@@ -233,6 +239,39 @@ class _SdkLangfuseTracer:
             self._set_root_trace_attributes(obs, request)
 
         return obs
+
+    def update_trace_output(self, trace_id: str, output: Any) -> None:
+        """Best-effort trace output upsert for the Langfuse trace list."""
+        if self._config is None or not trace_id:
+            return
+
+        try:
+            import httpx
+
+            now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            payload = {
+                "batch": [
+                    {
+                        "id": str(uuid.uuid4()),
+                        "type": "trace-create",
+                        "timestamp": now,
+                        "body": {"id": trace_id, "output": output},
+                    }
+                ]
+            }
+            response = httpx.post(
+                f"{self._config.base_url.rstrip('/')}/api/public/ingestion",
+                json=payload,
+                auth=(self._config.public_key, self._config.secret_key),
+                headers={
+                    "x-langfuse-sdk-name": "by-framework-python",
+                    "x-langfuse-public-key": self._config.public_key,
+                },
+                timeout=5,
+            )
+            response.raise_for_status()
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
 
     @staticmethod
     def _set_root_trace_attributes(
@@ -313,7 +352,7 @@ class LangfusePlugin(Plugin):
         if self._tracer is not None:
             self._tracer.shutdown()
 
-    async def on_task_start(self, context: Any) -> None:
+    async def on_task_start(self, context: Any) -> None:  # pylint: disable=too-many-locals
         tracer = self._get_tracer()
         observation_store = self._get_observation_store(context)
         identity = self._build_task_identity(context)
@@ -340,6 +379,11 @@ class LangfusePlugin(Plugin):
             if getattr(context, "current_command", None) is not None
             else False
         )
+        observation_anchor = execution_anchor
+        if is_resume:
+            resume_parent = identity.parent_message_id or "root"
+            observation_anchor = f"{execution_anchor}:resume:{resume_parent}"
+
         root_parent_id = metadata.get(LANGFUSE_PARENT_OBSERVATION_METADATA_KEY)
         if not identity.parent_message_id and is_resume:
             # For top-level task resumption, do not parent to any observation id
@@ -360,7 +404,7 @@ class LangfusePlugin(Plugin):
 
         worker_execute_obs = tracer.start_observation(
             _ObservationStartRequest(
-                span_id=str_to_uint64(f"{execution_anchor}:worker.execute"),
+                span_id=str_to_uint64(f"{observation_anchor}:worker.execute"),
                 trace_id=trace_id_hex,
                 parent_observation_id=worker_execute_parent,
                 name="worker.execute",
@@ -371,7 +415,7 @@ class LangfusePlugin(Plugin):
 
         observation = tracer.start_observation(
             _ObservationStartRequest(
-                span_id=str_to_uint64(f"{execution_anchor}:agent.task"),
+                span_id=str_to_uint64(f"{observation_anchor}:agent.task"),
                 trace_id=trace_id_hex,
                 parent_observation_id=worker_execute_obs.id
                 if worker_execute_obs is not None
@@ -391,7 +435,9 @@ class LangfusePlugin(Plugin):
         )
 
     async def on_task_complete(self, context: Any, result: Any) -> None:
-        self._end_observation(context, output=self._serialize_value(result))
+        serialized_output = self._serialize_value(result)
+        self._end_observation(context, output=serialized_output)
+        self._update_trace_output(context, output=serialized_output)
 
     async def on_task_error(self, context: Any, error: Exception) -> None:
         observations = self._iter_context_observations(context)
@@ -404,6 +450,7 @@ class LangfusePlugin(Plugin):
             context,
             output={"error": str(error)},
         )
+        self._update_trace_output(context, output={"error": str(error)})
 
     async def on_task_cancel(self, context: Any, command: Any) -> None:
         observations = self._iter_context_observations(context)
@@ -414,6 +461,10 @@ class LangfusePlugin(Plugin):
         for observation in observations:
             observation.update(level="WARNING", status_message=reason)
         self._end_observation(
+            context,
+            output={"cancelled": True, "reason": reason},
+        )
+        self._update_trace_output(
             context,
             output={"cancelled": True, "reason": reason},
         )
@@ -462,7 +513,7 @@ class LangfusePlugin(Plugin):
                 host=config.base_url,
             )
 
-        return _SdkLangfuseTracer(client)
+        return _SdkLangfuseTracer(client, config)
 
     @staticmethod
     def _build_task_identity(context: Any) -> _TaskIdentity:
@@ -560,6 +611,21 @@ class LangfusePlugin(Plugin):
                 observation.update(output=serialized_output)
                 observation.end()
 
+    def _update_trace_output(self, context: Any, *, output: Any) -> None:
+        tracer = self._tracer
+        if tracer is None or not hasattr(tracer, "update_trace_output"):
+            return
+
+        trace_id = getattr(context, "trace_id", "")
+        if not trace_id:
+            return
+
+        try:
+            trace_id_hex = f"{str_to_uint128(trace_id):032x}"
+            tracer.update_trace_output(trace_id_hex, self._serialize_value(output))
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
 
 class LangfuseTraceProviderFactory(TraceProviderFactory):
     """Factory that enables Langfuse tracing when the environment is configured."""
@@ -621,7 +687,7 @@ def start_client_dispatch_observation(
         "user_name": user_name,
         "header_metadata": LangfusePlugin._serialize_value(metadata or {}),
     }
-    return _SdkLangfuseTracer(client).start_observation(
+    return _SdkLangfuseTracer(client, config).start_observation(
         _ObservationStartRequest(
             span_id=str_to_uint64(f"{message_id}:client.dispatch"),
             trace_id=trace_id_hex,

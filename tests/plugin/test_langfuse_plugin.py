@@ -38,6 +38,7 @@ class FakeTracer:
 
     def __init__(self):
         self.start_calls: list[dict[str, Any]] = []
+        self.trace_output_updates: list[dict[str, Any]] = []
         self.shutdown_called = False
 
     def start_observation(self, request: Any) -> FakeObservation:
@@ -57,6 +58,9 @@ class FakeTracer:
 
     def shutdown(self) -> None:
         self.shutdown_called = True
+
+    def update_trace_output(self, trace_id: str, output: Any) -> None:
+        self.trace_output_updates.append({"trace_id": trace_id, "output": output})
 
 
 class EndWithoutKwargsObservation:
@@ -344,6 +348,64 @@ async def test_resume_ignores_parent_observation_id_metadata():
 
 
 @pytest.mark.asyncio
+async def test_resume_uses_distinct_span_ids_to_avoid_parent_cycles():
+    """Resume stages must not reuse the original agent.task observation id."""
+    from by_framework.observability.span_recorder import str_to_uint64
+
+    tracer = FakeTracer()
+    store = FakeObservationStore()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=store)
+
+    initial_context = _build_context(
+        message_id="msg-parent",
+        parent_message_id="",
+        current_agent_id="planner",
+        langfuse_parent_observation_id="obs-client-dispatch",
+    )
+    initial_context.execution_id = "exec-1"
+    await plugin.on_task_start(initial_context)
+
+    resume_command = ResumeCommand(
+        header=MessageHeader(
+            message_id="msg-parent",
+            session_id="session-1",
+            trace_id="trace-1",
+            target_agent_type="planner",
+            parent_message_id="msg-child",
+            langfuse_parent_observation_id="obs-previous-agent",
+        ),
+        status="success",
+        reply_data=None,
+    )
+    resume_context = AgentContext(
+        session_id="session-1",
+        trace_id="trace-1",
+        redis_client=object(),
+        current_agent_id="planner",
+        message_id="msg-parent",
+        parent_message_id="msg-child",
+        current_command=resume_command,
+        execution_id="exec-1",
+    )
+    await plugin.on_task_start(resume_context)
+
+    initial_agent_call = tracer.start_calls[1]
+    resume_worker_call = tracer.start_calls[2]
+    resume_agent_call = tracer.start_calls[3]
+
+    assert initial_agent_call["span_id"] == str_to_uint64("exec-1:agent.task")
+    assert resume_worker_call["span_id"] == str_to_uint64(
+        "exec-1:resume:msg-child:worker.execute"
+    )
+    assert resume_agent_call["span_id"] == str_to_uint64(
+        "exec-1:resume:msg-child:agent.task"
+    )
+    assert resume_agent_call["span_id"] != initial_agent_call["span_id"]
+    assert resume_worker_call["parent_observation_id"] == "obs-previous-agent"
+    assert resume_agent_call["parent_observation_id"] == "obs-3"
+
+
+@pytest.mark.asyncio
 async def test_langfuse_plugin_child_task_does_not_become_trace_root():
     """Child task observations stay nested under the parent task trace root."""
     tracer = FakeTracer()
@@ -424,6 +486,12 @@ async def test_langfuse_plugin_ends_observation_with_result_output():
     assert observation.ended_with == {
         "output": {"status": "COMPLETED", "answer": "done"}
     }
+    assert tracer.trace_output_updates == [
+        {
+            "trace_id": "12345678901234567890123456789012",
+            "output": {"status": "COMPLETED", "answer": "done"},
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -440,6 +508,12 @@ async def test_langfuse_plugin_marks_errors_on_task_failure():
     assert observation.updates[-1]["level"] == "ERROR"
     assert observation.updates[-1]["status_message"] == "boom"
     assert observation.ended_with == {"output": {"error": "boom"}}
+    assert tracer.trace_output_updates == [
+        {
+            "trace_id": "12345678901234567890123456789012",
+            "output": {"error": "boom"},
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -467,6 +541,12 @@ async def test_langfuse_plugin_marks_cancellation_and_ends_observation():
     assert observation.ended_with == {
         "output": {"cancelled": True, "reason": "user cancelled"}
     }
+    assert tracer.trace_output_updates == [
+        {
+            "trace_id": "12345678901234567890123456789012",
+            "output": {"cancelled": True, "reason": "user cancelled"},
+        }
+    ]
 
 
 def test_langfuse_plugin_builds_sdk_client_with_constructor(monkeypatch):

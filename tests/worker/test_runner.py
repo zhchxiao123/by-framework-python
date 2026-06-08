@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 from typing import Any
-from unittest.mock import ANY, AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from by_framework import (
     AgentTaskResult,
@@ -283,6 +283,54 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(span.worker_id, "worker-1")
         self.assertEqual(span.target_agent_type, "dummy_agent")
         self.assertEqual(span.status, AgentState.COMPLETED.value)
+
+    async def test_runner_uses_propagated_trace_parent_for_worker_execute_span(self):
+        """worker.execute should attach to the header-propagated client span id."""
+        redis_mock = MockRedisRunner(message_to_return=[])
+        worker = DummyWorker()
+        worker.registry = AsyncMock()
+        worker.registry.get_execution_by_message_id.return_value = {
+            "execution_id": "exec-worker",
+            "message_id": "msg-worker",
+            "session_id": "sess-1",
+            "trace_id": "trace-worker",
+            "parent_message_id": "",
+            "target_agent_type": "dummy_agent",
+            "created_at": 100,
+        }
+        span_recorder = AsyncMock()
+
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            span_recorder=span_recorder,
+        )
+        payload = AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-worker",
+                session_id="sess-1",
+                trace_id="trace-worker",
+                target_agent_type="dummy_agent",
+                trace_parent_span_id="0123456789abcdef",
+            ),
+            content="test",
+        ).to_dict()
+
+        with patch("by_framework.worker.runner.live_execution_otel_span") as live_span:
+            execute_span = Mock()
+            live_span.return_value.__aenter__ = AsyncMock(return_value=execute_span)
+            live_span.return_value.__aexit__ = AsyncMock(return_value=None)
+            await runner._process_message_from_dict(
+                RedisKeys.ctrl_stream("dummy_agent"), "1-0", payload
+            )
+
+        live_span.assert_called_once()
+        self.assertEqual(
+            live_span.call_args.kwargs["parent_span_id"], "0123456789abcdef"
+        )
+        span = span_recorder.record_span.await_args.args[0]
+        self.assertEqual(span.parent_span_id, "0123456789abcdef")
 
     async def test_runner_persists_structured_failure_details(self):
         """Test terminal execution updates include structured failure fields."""

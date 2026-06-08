@@ -500,7 +500,7 @@ provides-extras = ["dev", "langfuse", "phoenix"]
 
 [[package]]
 name = "by-framework-trace-langfuse"
-version = "0.0.3.dev0"
+version = "0.0.3.dev1"
 source = { editable = "libs/by-framework-trace-langfuse" }
 dependencies = [
     { name = "by-framework" },

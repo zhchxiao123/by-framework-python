@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from by_framework.observability.metrics import (
+from by_framework.metrics import (
     PROMETHEUS_AVAILABLE,
     build_observability_diagnostics_metrics,
     generate_latest_metrics,
     get_registry,
     record_execution_metrics,
 )
-from by_framework.observability.span_recorder import (
+from by_framework.trace.span_recorder import (
     TraceSpan,
     get_observability_diagnostics,
     reset_observability_diagnostics,
@@ -56,7 +56,7 @@ def test_build_observability_diagnostics_metrics_exports_drop_and_failure_counts
     reset_observability_diagnostics()
 
     # Mutate diagnostics through public record behavior.
-    from by_framework.observability.span_recorder import SpanRecorder
+    from by_framework.trace.span_recorder import SpanRecorder
 
     recorder = SpanRecorder(exporters=[])
     span = TraceSpan(

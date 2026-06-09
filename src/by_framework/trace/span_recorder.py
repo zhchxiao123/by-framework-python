@@ -10,7 +10,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
 from inspect import isawaitable
-from typing import (Any, AsyncIterator, Optional, Protocol, Sequence, runtime_checkable)
+from typing import Any, AsyncIterator, Optional, Protocol, Sequence, runtime_checkable
 
 from by_framework.common.constants import RedisKeys
 from by_framework.common.logger import logger
@@ -287,6 +287,13 @@ class TraceSpan:
     start_ts: int
     end_ts: int
     status: str
+    name: str = ""
+    kind: str = ""
+    source: str = "redis"
+    input: Any = None
+    output: Any = None
+    tokens: dict[str, Any] = field(default_factory=dict)
+    cost: dict[str, Any] = field(default_factory=dict)
     session_id: str = ""
     execution_id: str = ""
     message_id: str = ""
@@ -312,6 +319,7 @@ class TraceSpan:
         payload["start_ts"] = int(self.start_ts or 0)
         payload["end_ts"] = max(payload["start_ts"], int(self.end_ts or 0))
         payload["duration_ms"] = max(0, payload["end_ts"] - payload["start_ts"])
+        payload["name"] = self.name or self.operation
         if payload.get("error_message"):
             payload["error_message"] = _sanitize_value(
                 "error_message", payload["error_message"]
@@ -363,6 +371,27 @@ class RedisSpanExporter:
         await self._call_pipeline(
             pipe, "hset", meta_key, "status", str(payload.get("status", ""))
         )
+        operation = str(payload.get("operation", ""))
+        if payload.get("name") and operation.startswith("client.dispatch"):
+            await self._call_pipeline(
+                pipe, "hset", meta_key, "name", str(payload.get("name", ""))
+            )
+        if payload.get("target_agent_type") and operation.startswith("client.dispatch"):
+            await self._call_pipeline(
+                pipe,
+                "hset",
+                meta_key,
+                "root_agent_type",
+                str(payload.get("target_agent_type", "")),
+            )
+        if payload.get("message_id") and operation.startswith("client.dispatch"):
+            await self._call_pipeline(
+                pipe,
+                "hset",
+                meta_key,
+                "root_message_id",
+                str(payload.get("message_id", "")),
+            )
         await self._call_pipeline(pipe, "hset", meta_key, "start_ts", start_ts)
         await self._call_pipeline(
             pipe,

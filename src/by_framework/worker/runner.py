@@ -27,7 +27,7 @@ from by_framework.core.protocol.commands import (
 )
 from by_framework.core.protocol.results import AgentTaskResult
 from by_framework.core.registry import ExecutionCompletionFields
-from by_framework.observability.span_recorder import (
+from by_framework.trace.span_recorder import (
     SpanRecorder,
     TraceSpan,
     build_observability_config,
@@ -473,7 +473,7 @@ class WorkerRunner:
                 if created_at > 0 and execution_started_at >= created_at:
                     queue_wait_ms_val = execution_started_at - created_at
 
-                from by_framework.observability.metrics import record_execution_metrics
+                from by_framework.metrics import record_execution_metrics
 
                 record_execution_metrics(
                     status=final_status,

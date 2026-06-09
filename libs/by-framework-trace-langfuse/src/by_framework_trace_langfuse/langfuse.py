@@ -18,7 +18,7 @@ from by_framework.core.extensions import (
     TraceProviderFactory,
 )
 from by_framework.core.registry import WorkerRegistry
-from by_framework.observability.span_recorder import (
+from by_framework.trace.span_recorder import (
     configure_otel_id_generator,
     current_span_id_var,
     current_trace_id_var,
@@ -27,6 +27,8 @@ from by_framework.observability.span_recorder import (
 )
 
 LANGFUSE_OBSERVATION_ATTR = "_langfuse_observation"
+LANGFUSE_CALL_PARENT_OBSERVATION_ATTR = "_langfuse_call_parent_observation"
+LANGFUSE_WORKFLOW_OBSERVATION_ATTR = "_langfuse_workflow_observation"
 WORKER_EXECUTE_OBSERVATION_ATTR = "_langfuse_worker_execute_observation"
 LANGFUSE_PARENT_OBSERVATION_METADATA_KEY = "langfuse_parent_observation_id"
 _QUOTES_TO_STRIP = "\"'“”‘’"
@@ -331,6 +333,7 @@ class LangfusePlugin(Plugin):
         super().__init__(PluginManifest(plugin_id=plugin_id, enabled=enabled))
         self._tracer = tracer
         self._observation_store = observation_store
+        self._active_workflows: dict[tuple[str, str], ObservationHandle] = {}
 
     async def register_agent_configs(
         self, build_context: Any
@@ -372,8 +375,9 @@ class LangfusePlugin(Plugin):
         )
         metadata = self._build_metadata(identity, context)
 
-        # Parent worker.execute to client.dispatch for top-level tasks. For child
-        # agents, parent to the stored observation id of the calling task.
+        # Parent worker.execute under a durable workflow node. The workflow spans
+        # the logical task across async suspend/resume; worker.execute only spans
+        # one concrete worker execution segment.
         is_resume = (
             "ResumeCommand" in context.current_command.__class__.__name__
             if getattr(context, "current_command", None) is not None
@@ -385,28 +389,41 @@ class LangfusePlugin(Plugin):
             observation_anchor = f"{execution_anchor}:resume:{resume_parent}"
 
         root_parent_id = metadata.get(LANGFUSE_PARENT_OBSERVATION_METADATA_KEY)
-        if not identity.parent_message_id and is_resume:
-            # For top-level task resumption, do not parent to any observation id
-            # (especially to avoid parenting back to its own first stage which is in metadata).
-            # This lets Langfuse automatically root it under the main trace.
-            worker_execute_parent = ""
-        elif root_parent_id:
-            worker_execute_parent = str(root_parent_id)
-        elif identity.parent_message_id:
-            worker_execute_parent = (
-                await observation_store.get_observation_id(
-                    identity.session_id, identity.parent_message_id
-                )
-                or ""
+        workflow_root_parent_id = (
+            ""
+            if is_resume and not identity.parent_message_id
+            else str(root_parent_id or "")
+        )
+        workflow_key = (identity.session_id, identity.message_id)
+        workflow_obs = self._active_workflows.get(workflow_key)
+        workflow_span_id = str_to_uint64(f"{execution_anchor}:agent.workflow")
+        workflow_observation_id = f"{workflow_span_id:016x}"
+
+        if workflow_obs is None:
+            workflow_parent = await self._resolve_parent_observation_id(
+                identity=identity,
+                observation_store=observation_store,
+                root_parent_id=workflow_root_parent_id,
+                excluded_parent_id=workflow_observation_id,
             )
-        else:
-            worker_execute_parent = ""
+            workflow_obs = tracer.start_observation(
+                _ObservationStartRequest(
+                    span_id=workflow_span_id,
+                    trace_id=trace_id_hex,
+                    parent_observation_id=workflow_parent,
+                    name=f"agent.workflow:{identity.agent_id}",
+                    observation_input=command_input,
+                    metadata=metadata,
+                )
+            )
+            if workflow_obs is not None:
+                self._active_workflows[workflow_key] = workflow_obs
 
         worker_execute_obs = tracer.start_observation(
             _ObservationStartRequest(
                 span_id=str_to_uint64(f"{observation_anchor}:worker.execute"),
                 trace_id=trace_id_hex,
-                parent_observation_id=worker_execute_parent,
+                parent_observation_id=workflow_obs.id if workflow_obs else "",
                 name="worker.execute",
                 observation_input=command_input,
                 metadata=metadata,
@@ -427,16 +444,21 @@ class LangfusePlugin(Plugin):
         )
 
         setattr(context, LANGFUSE_OBSERVATION_ATTR, observation)
+        setattr(context, LANGFUSE_WORKFLOW_OBSERVATION_ATTR, workflow_obs)
+        setattr(context, LANGFUSE_CALL_PARENT_OBSERVATION_ATTR, workflow_obs)
         setattr(context, WORKER_EXECUTE_OBSERVATION_ATTR, worker_execute_obs)
         # Child agents resolve this task through parent_message_id and nest under
-        # agent.task.
-        await observation_store.set_observation_id(
-            identity.session_id, identity.message_id, observation.id
-        )
+        # the durable workflow instead of a worker segment that may end on suspend.
+        if workflow_obs is not None:
+            await observation_store.set_observation_id(
+                identity.session_id, identity.message_id, workflow_obs.id
+            )
 
     async def on_task_complete(self, context: Any, result: Any) -> None:
         serialized_output = self._serialize_value(result)
         self._end_observation(context, output=serialized_output)
+        if not self._is_non_terminal_result(result):
+            self._end_workflow_observation(context, output=serialized_output)
         self._update_trace_output(context, output=serialized_output)
 
     async def on_task_error(self, context: Any, error: Exception) -> None:
@@ -450,6 +472,7 @@ class LangfusePlugin(Plugin):
             context,
             output={"error": str(error)},
         )
+        self._end_workflow_observation(context, output={"error": str(error)})
         self._update_trace_output(context, output={"error": str(error)})
 
     async def on_task_cancel(self, context: Any, command: Any) -> None:
@@ -464,10 +487,33 @@ class LangfusePlugin(Plugin):
             context,
             output={"cancelled": True, "reason": reason},
         )
+        self._end_workflow_observation(
+            context,
+            output={"cancelled": True, "reason": reason},
+        )
         self._update_trace_output(
             context,
             output={"cancelled": True, "reason": reason},
         )
+
+    async def _resolve_parent_observation_id(
+        self,
+        *,
+        identity: _TaskIdentity,
+        observation_store: ObservationStore,
+        root_parent_id: str,
+        excluded_parent_id: str,
+    ) -> str:
+        """Resolve the parent observation for a durable workflow span."""
+        if root_parent_id and root_parent_id != excluded_parent_id:
+            return root_parent_id
+        if identity.parent_message_id:
+            parent_id = await observation_store.get_observation_id(
+                identity.session_id, identity.parent_message_id
+            )
+            if parent_id and parent_id != excluded_parent_id:
+                return parent_id
+        return ""
 
     def _get_tracer(self) -> LangfuseTracer:
         tracer = self._tracer or self._build_default_tracer()
@@ -519,11 +565,21 @@ class LangfusePlugin(Plugin):
     def _build_task_identity(context: Any) -> _TaskIdentity:
         command = getattr(context, "current_command", None)
         header = getattr(command, "header", None)
+        is_resume = (
+            "ResumeCommand" in command.__class__.__name__
+            if command is not None
+            else False
+        )
+        parent_message_id = getattr(context, "parent_message_id", "")
+        if is_resume and header is not None:
+            parent_message_id = (
+                getattr(header, "parent_message_id", "") or parent_message_id
+            )
         return _TaskIdentity(
             session_id=getattr(context, "session_id", ""),
             trace_id=getattr(context, "trace_id", ""),
             message_id=getattr(context, "message_id", ""),
-            parent_message_id=getattr(context, "parent_message_id", ""),
+            parent_message_id=parent_message_id,
             agent_id=(
                 getattr(context, "current_agent_id", "")
                 or getattr(header, "target_agent_type", "")
@@ -610,6 +666,32 @@ class LangfusePlugin(Plugin):
             except TypeError:
                 observation.update(output=serialized_output)
                 observation.end()
+
+    def _end_workflow_observation(self, context: Any, *, output: Any) -> None:
+        observation = getattr(context, LANGFUSE_WORKFLOW_OBSERVATION_ATTR, None)
+        if observation is None:
+            return
+
+        serialized_output = self._serialize_value(output)
+        try:
+            observation.end(output=serialized_output)
+        except TypeError:
+            observation.update(output=serialized_output)
+            observation.end()
+
+        key = (
+            str(getattr(context, "session_id", "")),
+            str(getattr(context, "message_id", "")),
+        )
+        if self._active_workflows.get(key) is observation:
+            self._active_workflows.pop(key, None)
+
+    @staticmethod
+    def _is_non_terminal_result(result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        status = str(result.get("status", ""))
+        return status == "QUEUED" or status.startswith("QUEUED:")
 
     def _update_trace_output(self, context: Any, *, output: Any) -> None:
         tracer = self._tracer

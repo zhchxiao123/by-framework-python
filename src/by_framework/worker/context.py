@@ -53,7 +53,7 @@ from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.core.runtime import AgentRuntimeState
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.runtime.filestore.base import FileStorage
-from by_framework.observability.span_recorder import SpanRecorder, TraceSpan
+from by_framework.trace.span_recorder import SpanRecorder, TraceSpan
 
 if TYPE_CHECKING:
     from by_framework.core.extensions import PluginRegistry
@@ -569,7 +569,11 @@ class AgentContext:
             ) or self.current_command.header.metadata.get("trace_parent_span_id", "")
 
         langfuse_parent_observation_id = ""
-        current_obs = getattr(self, "_langfuse_observation", None)
+        current_obs = getattr(
+            self,
+            "_langfuse_call_parent_observation",
+            None,
+        ) or getattr(self, "_langfuse_observation", None)
         current_obs_id = getattr(current_obs, "id", None) if current_obs else None
         if current_obs_id:
             langfuse_parent_observation_id = str(current_obs_id)
@@ -833,7 +837,11 @@ class AgentContext:
                 )
 
             langfuse_parent_observation_id = ""
-            current_obs = getattr(self, "_langfuse_observation", None)
+            current_obs = getattr(
+                self,
+                "_langfuse_call_parent_observation",
+                None,
+            ) or getattr(self, "_langfuse_observation", None)
             current_obs_id = getattr(current_obs, "id", None) if current_obs else None
             if current_obs_id:
                 langfuse_parent_observation_id = str(current_obs_id)
@@ -1065,7 +1073,7 @@ class AgentContext:
             import os
             from importlib import import_module
 
-            from by_framework.observability.span_recorder import (
+            from by_framework.trace.span_recorder import (
                 str_to_uint64,
                 str_to_uint128,
             )

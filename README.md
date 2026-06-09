@@ -616,7 +616,7 @@ pending/lag, failure details, routing decisions, derived alerts, and segmented
 queue/run/end-to-end task latency:
 
 ```bash
-uv run python -m by_framework.observability.dashboard --host 127.0.0.1 --port 8765
+uv run --package by-framework-dashboard by-framework-dashboard --host 127.0.0.1 --port 8765
 ```
 
 Open `http://127.0.0.1:8765/`. For a local UI preview without Redis, open
@@ -632,8 +632,9 @@ Alert thresholds can be tuned with `--queue-backlog-threshold`,
 `--failed-execution-threshold`.
 
 The dashboard frontend is built with React/Vite under
-`src/by_framework/observability/frontend`; its production build is packaged in
-`src/by_framework/observability/static`.
+`libs/by-framework-dashboard/frontend`; its production build is packaged in
+`libs/by-framework-dashboard/src/by_framework_dashboard/static`. See
+`libs/by-framework-dashboard/README.md` for dashboard-specific runbook details.
 
 ---
 

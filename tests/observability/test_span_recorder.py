@@ -6,8 +6,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from by_framework import RedisKeys
-from by_framework.observability import span_recorder as span_module
-from by_framework.observability.span_recorder import (
+from by_framework.trace import span_recorder as span_module
+from by_framework.trace.span_recorder import (
     OTelSpanExporter,
     RedisSpanExporter,
     SpanRecorder,
@@ -194,7 +194,6 @@ async def test_span_recorder_records_export_failures():
     span_module.reset_observability_diagnostics()
 
     class FailingExporter:
-
         async def export_span(self, span):
             del span
             raise RuntimeError("backend unavailable")

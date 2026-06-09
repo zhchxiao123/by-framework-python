@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from by_framework.common.config import RedisConfig
 from by_framework.common.logger import logger
 from by_framework.common.redis_client import close_redis, init_redis
-from by_framework.observability.snapshot import (
+from by_framework.metrics.snapshot import (
     AlertPolicy,
     build_demo_observability_history,
     build_demo_observability_snapshot,
@@ -38,13 +38,17 @@ from by_framework.observability.snapshot import (
     load_history_from_redis,
     save_history_point_to_redis,
 )
+from by_framework_dashboard.adapters import (
+    trace_result_to_dashboard_summary,
+    trace_result_to_dashboard_trace,
+)
 
 METRICS_CACHE_TTL = 15  # Cache /metrics briefly to avoid full Redis scans per scrape.
 
 # A hook for custom HTTP clients (e.g. for testing fallback tracing retrieval)
 _fallback_http_client_class = None
 
-STATIC_PACKAGE = "by_framework.observability.static"
+STATIC_PACKAGE = "by_framework_dashboard.static"
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -374,7 +378,7 @@ def _parse_external_trace(trace_id: str, data: dict[str, Any]) -> dict[str, Any]
                 }
             )
 
-        from by_framework.observability.snapshot import _build_trace_snapshot
+        from by_framework.metrics.snapshot import _build_trace_snapshot
 
         session_id = spans[0].get("metadata", {}).get("session_id", "") if spans else ""
         return _build_trace_snapshot(trace_id, session_id, spans)
@@ -759,35 +763,30 @@ def make_handler(
                     )
                     return
                 session_id = _first_param(params, "session_id")
-                if not session_id:
+                worker_id = _first_param(params, "worker_id")
+                agent_type = _first_param(params, "agent_type")
+                if not session_id and not worker_id and not agent_type:
                     self._send_json(
                         {
-                            "error": "session_id is required for live trace listing",
+                            "error": (
+                                "session_id, worker_id, or agent_type is required "
+                                "for live trace listing"
+                            ),
                             "status": "error",
                         },
                         status=HTTPStatus.BAD_REQUEST,
                     )
                     return
                 try:
-                    session_snapshot = async_runner.run(
-                        build_session_observability_snapshot(None, session_id)
-                    )
-                    traces = []
-                    for trace_id in sorted(
-                        {
-                            str(execution.get("trace_id", ""))
-                            for execution in session_snapshot.get("executions", [])
-                            if execution.get("trace_id")
-                        }
-                    ):
-                        trace = async_runner.run(
-                            build_trace_observability_snapshot(
-                                None,
-                                trace_id,
-                                session_id=session_id,
-                            )
+                    traces = async_runner.run(
+                        _list_trace_summaries_via_read_sdk(
+                            redis_client,
+                            session_id=session_id,
+                            worker_id=worker_id,
+                            agent_type=agent_type,
+                            limit=_int_param(params, "limit", 50) or 50,
                         )
-                        traces.append(_trace_summary(trace))
+                    )
                 except Exception as err:  # pylint: disable=broad-exception-caught
                     state.record_error(
                         path,
@@ -832,8 +831,8 @@ def make_handler(
                 try:
 
                     async def _get_trace_with_fallback() -> dict[str, Any]:
-                        trace_snap = await build_trace_observability_snapshot(
-                            None,
+                        trace_snap = await _get_trace_snapshot_via_read_sdk(
+                            redis_client,
                             trace_id,
                             session_id=session_id,
                         )
@@ -896,11 +895,13 @@ def make_handler(
                             )
                             _metrics_cache["snapshot"] = snapshot
                             _metrics_cache["time"] = time.time()
-                    from by_framework.observability.metrics import (
+                    from by_framework.metrics import (
                         build_observability_diagnostics_metrics,
                         generate_latest_metrics,
                     )
-                    from by_framework.observability.span_recorder import get_observability_diagnostics
+                    from by_framework.trace.span_recorder import (
+                        get_observability_diagnostics,
+                    )
 
                     body, content_type = serialize_text(
                         build_prometheus_metrics(snapshot)
@@ -1021,6 +1022,76 @@ def _trace_summary(trace: dict[str, Any]) -> dict[str, Any]:
         "duration_ms": trace.get("duration_ms", 0),
         "span_count": trace.get("span_count", 0),
     }
+
+
+def _trace_read_client(redis_client: Any = None) -> Any:
+    from by_framework_trace_query import TraceReadClient
+
+    return TraceReadClient(redis_client=redis_client)
+
+
+async def _list_trace_summaries_via_read_sdk(
+    redis_client: Any,
+    *,
+    session_id: str = "",
+    worker_id: str = "",
+    agent_type: str = "",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    try:
+        trace_results = await asyncio.wait_for(
+            _trace_read_client(redis_client).list_traces(
+                session_id=session_id,
+                worker_id=worker_id,
+                agent_type=agent_type,
+                limit=limit,
+            ),
+            timeout=2.0,
+        )
+        return [trace_result_to_dashboard_summary(result) for result in trace_results]
+    except Exception as err:  # pylint: disable=broad-exception-caught
+        logger.warning("TraceReadClient list fallback: %s", err)
+        if not session_id:
+            raise
+        session_snapshot = await build_session_observability_snapshot(
+            redis_client, session_id
+        )
+        traces = []
+        for trace_id in sorted(
+            {
+                str(execution.get("trace_id", ""))
+                for execution in session_snapshot.get("executions", [])
+                if execution.get("trace_id")
+            }
+        )[:limit]:
+            trace = await build_trace_observability_snapshot(
+                redis_client,
+                trace_id,
+                session_id=session_id,
+            )
+            traces.append(_trace_summary(trace))
+        return traces
+
+
+async def _get_trace_snapshot_via_read_sdk(
+    redis_client: Any,
+    trace_id: str,
+    *,
+    session_id: str = "",
+) -> dict[str, Any]:
+    try:
+        trace_result = await asyncio.wait_for(
+            _trace_read_client(redis_client).get_trace(trace_id, session_id=session_id),
+            timeout=2.0,
+        )
+        return trace_result_to_dashboard_trace(trace_result)
+    except Exception as err:  # pylint: disable=broad-exception-caught
+        logger.warning("TraceReadClient fallback for trace %s: %s", trace_id, err)
+        return await build_trace_observability_snapshot(
+            redis_client,
+            trace_id,
+            session_id=session_id,
+        )
 
 
 def _trace_timeline_payload(trace: dict[str, Any]) -> dict[str, Any]:

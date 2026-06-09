@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from by_framework.observability.snapshot import _escape_label
-
 try:
     from prometheus_client import REGISTRY, Counter, Histogram  # type: ignore
 
@@ -37,6 +35,10 @@ class DummyMetric:
 
     def set(self, value: float) -> None:
         del value
+
+
+def _escape_label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def get_registry() -> Any:

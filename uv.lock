@@ -11,11 +11,13 @@ resolution-markers = [
 members = [
     "by-framework",
     "by-framework-adk",
+    "by-framework-dashboard",
     "by-framework-history-byclaw",
     "by-framework-history-postgres",
     "by-framework-langgraph",
     "by-framework-trace-langfuse",
     "by-framework-trace-phoenix",
+    "by-framework-trace-query",
 ]
 
 [[package]]
@@ -391,6 +393,21 @@ requires-dist = [
 provides-extras = ["dev"]
 
 [[package]]
+name = "by-framework-dashboard"
+version = "0.1.0"
+source = { editable = "libs/by-framework-dashboard" }
+dependencies = [
+    { name = "by-framework" },
+    { name = "by-framework-trace-query" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "by-framework", editable = "." },
+    { name = "by-framework-trace-query", editable = "libs/by-framework-trace-query" },
+]
+
+[[package]]
 name = "by-framework-history-byclaw"
 version = "0.0.4.dev0"
 source = { editable = "libs/by-framework-history-byclaw" }
@@ -567,6 +584,17 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3.0" },
 ]
 provides-extras = ["dev"]
+
+[[package]]
+name = "by-framework-trace-query"
+version = "0.1.0"
+source = { editable = "libs/by-framework-trace-query" }
+dependencies = [
+    { name = "by-framework" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "by-framework", editable = "." }]
 
 [[package]]
 name = "certifi"

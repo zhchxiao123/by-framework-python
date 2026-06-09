@@ -523,12 +523,12 @@ def build_prometheus_metrics(snapshot: dict[str, Any]) -> str:
             )
             lines.append(
                 "by_framework_stream_pending_messages"
-                f"{{{labels}}} {int(group.get("pending", 0) or 0)}"
+                f"{{{labels}}} {int(group.get('pending', 0) or 0)}"
             )
             lag = group.get("lag")
             if lag is not None:
                 lines.append(
-                    "by_framework_stream_consumer_lag" f"{{{labels}}} {int(lag or 0)}"
+                    f"by_framework_stream_consumer_lag{{{labels}}} {int(lag or 0)}"
                 )
 
     lines.extend(
@@ -1424,7 +1424,7 @@ def _build_queue_alerts(
                     "code": "QUEUE_BACKLOG",
                     "severity": "warning",
                     "message": (
-                        f"{length} messages queued for agent type " f"{agent_type}."
+                        f"{length} messages queued for agent type {agent_type}."
                     ),
                     "value": length,
                     "threshold": policy.queue_backlog_threshold,

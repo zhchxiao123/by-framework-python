@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from by_framework.observability.span_recorder import (
+from by_framework.trace.span_recorder import (
     ContextIdGenerator,
     OTelSpanExporter,
     TraceSpan,

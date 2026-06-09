@@ -7,7 +7,7 @@ from typing import Any
 
 from by_framework.core.protocol.commands import BaseCommand
 from by_framework.core.protocol.message_header import MessageHeader
-from by_framework.observability.span_recorder import str_to_uint128
+from by_framework.trace.span_recorder import str_to_uint128
 
 
 @dataclass(frozen=True)

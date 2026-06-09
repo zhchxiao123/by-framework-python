@@ -2,12 +2,12 @@
 
 from by_framework.core.protocol.commands import AskAgentCommand
 from by_framework.core.protocol.message_header import MessageHeader
-from by_framework.observability.external_trace import (
+from by_framework.trace.external_trace import (
     build_langfuse_trace_context,
     extract_external_trace_context,
     start_langfuse_observation,
 )
-from by_framework.observability.span_recorder import str_to_uint128
+from by_framework.trace.span_recorder import str_to_uint128
 
 
 class FakeLangfuseClient:

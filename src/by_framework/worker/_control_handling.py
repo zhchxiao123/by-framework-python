@@ -102,7 +102,7 @@ async def handle_cancel_task(
         if span_recorder is not None:
             import time as _time
 
-            from by_framework.observability.span_recorder import TraceSpan
+            from by_framework.trace.span_recorder import TraceSpan
 
             now_ms = int(_time.time() * 1000)
             try:

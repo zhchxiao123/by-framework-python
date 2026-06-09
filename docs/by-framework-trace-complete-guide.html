@@ -1,0 +1,1040 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>by-framework Trace 体系完整接入文档</title>
+  <style>
+    :root {
+      --bg: #f7f8fb;
+      --surface: #ffffff;
+      --surface-soft: #f1f5f9;
+      --text: #172033;
+      --muted: #64748b;
+      --line: #d8e0ea;
+      --primary: #2563eb;
+      --primary-ink: #12307a;
+      --cyan: #0891b2;
+      --green: #138a4a;
+      --amber: #b7791f;
+      --red: #c24135;
+      --violet: #6d28d9;
+      --code-bg: #111827;
+      --code-text: #e5edf8;
+      --radius: 8px;
+      --shadow: 0 18px 44px rgba(15, 23, 42, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        linear-gradient(180deg, rgba(37, 99, 235, 0.08), transparent 360px),
+        var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      line-height: 1.65;
+    }
+
+    a { color: var(--primary); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0.12rem 0.34rem;
+      background: #eef4ff;
+      color: var(--primary-ink);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+    pre {
+      overflow: auto;
+      margin: 0;
+      border-radius: var(--radius);
+      background: var(--code-bg);
+      color: var(--code-text);
+      padding: 18px;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      tab-size: 2;
+    }
+    pre code {
+      border: 0;
+      padding: 0;
+      background: transparent;
+      color: inherit;
+      font-size: inherit;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      gap: 28px;
+      width: min(1440px, calc(100% - 44px));
+      margin: 0 auto;
+      padding: 26px 0 56px;
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 22px;
+      align-self: start;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.86);
+      box-shadow: var(--shadow);
+      padding: 18px;
+      backdrop-filter: blur(14px);
+    }
+    .sidebar h2 {
+      margin: 0 0 14px;
+      font-size: 15px;
+      letter-spacing: 0.02em;
+    }
+    .sidebar a {
+      display: block;
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: #334155;
+      font-size: 14px;
+    }
+    .sidebar a:hover,
+    .sidebar a.active {
+      background: #e9f0ff;
+      color: var(--primary-ink);
+      text-decoration: none;
+    }
+    .sidebar .meta {
+      margin-top: 18px;
+      border-top: 1px solid var(--line);
+      padding-top: 14px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    main { min-width: 0; }
+    .hero {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      padding: 28px;
+    }
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(30px, 5vw, 54px);
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+    .lead {
+      max-width: 920px;
+      margin: 18px 0 0;
+      color: #475569;
+      font-size: 18px;
+    }
+    .hero-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 24px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fbfdff;
+      padding: 14px;
+    }
+    .metric strong {
+      display: block;
+      color: var(--text);
+      font-size: 22px;
+    }
+    .metric span { color: var(--muted); font-size: 13px; }
+
+    section {
+      margin-top: 22px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      padding: 24px;
+    }
+    section h2 {
+      margin: 0 0 12px;
+      font-size: 25px;
+      letter-spacing: 0;
+    }
+    section h3 {
+      margin: 20px 0 10px;
+      font-size: 17px;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 18px;
+      align-items: start;
+    }
+    .takeaway {
+      border-left: 4px solid var(--primary);
+      border-radius: 0 var(--radius) var(--radius) 0;
+      background: #eff6ff;
+      padding: 16px;
+    }
+    .takeaway p { margin: 0; }
+    .pill-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #f8fafc;
+      padding: 4px 10px;
+      color: #334155;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(130px, 1fr));
+      gap: 10px;
+      align-items: stretch;
+      margin-top: 16px;
+    }
+    .flow-card {
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fbfdff;
+      padding: 14px;
+      min-height: 118px;
+    }
+    .flow-card:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -18px;
+      top: 44%;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .flow-card b {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--primary-ink);
+    }
+    .flow-card span { color: var(--muted); font-size: 13px; }
+
+    .tree {
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fbfdff;
+      padding: 18px;
+      overflow: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.8;
+      white-space: nowrap;
+    }
+    .tree .root { color: var(--green); font-weight: 700; }
+    .tree .workflow { color: var(--violet); }
+    .tree .segment { color: var(--primary); }
+    .tree .leaf { color: #475569; }
+
+    .steps { display: grid; gap: 12px; }
+    details {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fbfdff;
+      padding: 0;
+      overflow: hidden;
+    }
+    summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 15px 16px;
+      font-weight: 700;
+    }
+    summary::-webkit-details-marker { display: none; }
+    summary::before {
+      content: "+";
+      display: inline-grid;
+      place-items: center;
+      width: 21px;
+      height: 21px;
+      margin-right: 10px;
+      border-radius: 5px;
+      background: #e8f0ff;
+      color: var(--primary);
+    }
+    details[open] summary::before { content: "−"; }
+    details > div {
+      border-top: 1px solid var(--line);
+      padding: 16px;
+    }
+
+    .code-tabs {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: var(--code-bg);
+    }
+    .tab-buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0;
+      background: #0b1220;
+      border-bottom: 1px solid #263244;
+    }
+    .tab-buttons button {
+      border: 0;
+      border-right: 1px solid #263244;
+      background: transparent;
+      color: #aab7ca;
+      cursor: pointer;
+      padding: 11px 14px;
+      font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .tab-buttons button.active {
+      background: #152036;
+      color: #ffffff;
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fbfdff;
+      padding: 16px;
+    }
+    .card h3 { margin-top: 0; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 6px;
+      padding: 2px 7px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .badge.green { background: #dcfce7; color: #166534; }
+    .badge.blue { background: #dbeafe; color: #1e40af; }
+    .badge.amber { background: #fef3c7; color: #92400e; }
+    .badge.red { background: #fee2e2; color: #991b1b; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      overflow: hidden;
+      border-radius: var(--radius);
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      vertical-align: top;
+      text-align: left;
+    }
+    th { background: #f1f5f9; color: #334155; }
+    td { background: #fff; }
+
+    .checklist {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .check {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fbfdff;
+      padding: 12px;
+      display: grid;
+      grid-template-columns: 24px minmax(0, 1fr);
+      gap: 8px;
+    }
+    .check::before {
+      content: "✓";
+      display: grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: #dcfce7;
+      color: #166534;
+      font-weight: 800;
+    }
+
+    .callout {
+      border: 1px solid #bfdbfe;
+      border-left: 4px solid var(--primary);
+      border-radius: var(--radius);
+      background: #eff6ff;
+      padding: 14px 16px;
+      color: #1e3a8a;
+    }
+    .warning {
+      border-color: #fde68a;
+      border-left-color: var(--amber);
+      background: #fffbeb;
+      color: #78350f;
+    }
+
+    .footer {
+      margin-top: 24px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 13px;
+    }
+
+    @media (max-width: 1100px) {
+      .layout { grid-template-columns: 1fr; }
+      .sidebar { position: static; }
+      .hero-grid, .flow, .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 720px) {
+      .layout { width: min(100% - 24px, 1440px); padding-top: 12px; }
+      .hero, section { padding: 18px; }
+      .summary, .grid-2, .grid-3, .hero-grid, .flow, .checklist {
+        grid-template-columns: 1fr;
+      }
+      .flow-card::after { display: none; }
+      h1 { font-size: 32px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar" aria-label="目录">
+      <h2>Trace 文档目录</h2>
+      <nav id="toc">
+        <a href="#overview">TL;DR</a>
+        <a href="#architecture">设计总览</a>
+        <a href="#model">统一数据模型</a>
+        <a href="#write">写入路径</a>
+        <a href="#read">读取 SDK</a>
+        <a href="#langfuse">Langfuse / Phoenix</a>
+        <a href="#usage">接入方式</a>
+        <a href="#dashboard">Dashboard</a>
+        <a href="#diagnostics">排查手册</a>
+        <a href="#faq">FAQ</a>
+      </nav>
+      <div class="meta">
+        <div>文档类型：Feature Explainer</div>
+        <div>适用版本：trace/metrics 子包化之后</div>
+        <div>生成时间：2026-06-09</div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="hero">
+        <p class="eyebrow">by-framework · trace architecture</p>
+        <h1>Trace 体系完整设计与接入指南</h1>
+        <p class="lead">
+          这份文档解释 by-framework 的 trace 写入规范、上下文传播、Langfuse/Phoenix 层级、
+          Redis Read SDK、Dashboard 查询链路，以及普通 Worker、LangGraph Worker、外部应用的接入方法。
+        </p>
+        <div class="hero-grid" aria-label="关键指标">
+          <div class="metric"><strong>4</strong><span>统一写入模型</span></div>
+          <div class="metric"><strong>3</strong><span>核心层级节点</span></div>
+          <div class="metric"><strong>2</strong><span>观测后端：Langfuse / Phoenix</span></div>
+          <div class="metric"><strong>1</strong><span>Trace Read SDK 入口</span></div>
+        </div>
+      </header>
+
+      <section id="overview">
+        <h2>TL;DR</h2>
+        <div class="summary">
+          <div class="takeaway">
+            <p>
+              by-framework 的 trace 目标是让 <b>client dispatch、worker execution、agent workflow、
+              LLM/tool/span、session event</b> 可以在同一个 trace 下被统一写入和读取。
+              写入侧使用 <code>by_framework.trace</code> 的 schema 和 best-effort writer；
+              读取侧使用独立包 <code>by-framework-trace-query</code>；
+              Dashboard 只是 Read SDK 的调用方。
+            </p>
+          </div>
+          <div>
+            <div class="pill-row">
+              <span class="pill">TraceWriteClient</span>
+              <span class="pill">TraceReadClient</span>
+              <span class="pill">RedisTraceSource</span>
+              <span class="pill">LangfusePlugin</span>
+              <span class="pill">PhoenixPlugin</span>
+              <span class="pill">Dashboard</span>
+            </div>
+            <p>
+              最关键的传播参数是 <code>trace_id</code>、<code>trace_parent_span_id</code>、
+              <code>langfuse_parent_observation_id</code>、<code>session_id</code>、
+              <code>message_id</code>、<code>parent_message_id</code>。
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section id="architecture">
+        <h2>设计总览</h2>
+        <p>
+          Trace 被拆成两个方向：写入规范负责把运行时事实稳定落到 Redis / Langfuse / Phoenix；
+          读取 SDK 负责把不同来源合并为一个可解释的 trace tree。这样 Dashboard、CLI、外部系统都可以复用同一套读能力。
+        </p>
+        <div class="flow" aria-label="trace pipeline">
+          <div class="flow-card">
+            <b>Client</b>
+            <span>创建或继承 trace id，发送 AskAgentCommand，写 client.dispatch。</span>
+          </div>
+          <div class="flow-card">
+            <b>Worker Runner</b>
+            <span>读取 header，恢复 trace parent，创建 execution 和 worker.execute。</span>
+          </div>
+          <div class="flow-card">
+            <b>Agent / LangGraph</b>
+            <span>执行任务、发 chunk、call_agent、resume，并传播 parent。</span>
+          </div>
+          <div class="flow-card">
+            <b>Trace Backends</b>
+            <span>Redis 是 v1 读取源；Langfuse/Phoenix 提供观测 UI 和 OTel/LLM 细节。</span>
+          </div>
+          <div class="flow-card">
+            <b>Read SDK</b>
+            <span>合并 spans、构建树、输出 diagnostics，供 Dashboard 使用。</span>
+          </div>
+        </div>
+
+        <h3>推荐的 Langfuse 层级</h3>
+        <div class="tree" aria-label="recommended langfuse hierarchy">
+          <div><span class="root">client.dispatch:langgraph-extension-demo</span> 13.4s</div>
+          <div>└─ <span class="segment">client.dispatch:langgraph-extension-demo</span> 0.01s</div>
+          <div>&nbsp;&nbsp;└─ <span class="workflow">agent.workflow:langgraph-extension-demo</span> 13.3s</div>
+          <div>&nbsp;&nbsp;&nbsp;&nbsp;├─ <span class="segment">worker.execute</span> 3.5s <span class="leaf">A initial</span></div>
+          <div>&nbsp;&nbsp;&nbsp;&nbsp;│&nbsp;&nbsp;└─ <span class="leaf">langgraph-extension-demo:langgraph</span> 3.3s</div>
+          <div>&nbsp;&nbsp;&nbsp;&nbsp;├─ <span class="workflow">agent.workflow:weather-agent</span> 5.3s</div>
+          <div>&nbsp;&nbsp;&nbsp;&nbsp;│&nbsp;&nbsp;└─ <span class="segment">worker.execute</span> 5.3s</div>
+          <div>&nbsp;&nbsp;&nbsp;&nbsp;└─ <span class="segment">worker.execute</span> 4.6s <span class="leaf">A resume</span></div>
+        </div>
+        <p class="callout">
+          <b>为什么要有 agent.workflow？</b>
+          <code>worker.execute</code> 是一次 worker 运行片段；LangGraph 遇到工具调用会 suspend 并返回
+          <code>QUEUED</code>。如果把异步 child 挂到已经结束的 agent task 下，Langfuse 会出现子节点耗时超过父节点。
+          workflow span 代表逻辑流程，跨 suspend/resume 保持打开，时间语义更自然。
+        </p>
+      </section>
+
+      <section id="model">
+        <h2>统一数据模型</h2>
+        <div class="grid-2">
+          <div class="card">
+            <h3><span class="badge blue">TraceRecord</span></h3>
+            <p>trace 级元数据，用于列表、检索、根输入输出和最终状态。</p>
+            <ul>
+              <li><code>trace_id</code>、<code>name</code>、<code>session_id</code></li>
+              <li><code>root_message_id</code>、<code>root_agent_type</code></li>
+              <li><code>input</code>、<code>output</code>、<code>status</code></li>
+              <li><code>start_ts</code>、<code>end_ts</code>、<code>metadata</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3><span class="badge green">ExecutionRecord</span></h3>
+            <p>任务执行级信息，主要落在 session registry 中，支持 fallback 重建。</p>
+            <ul>
+              <li><code>execution_id</code>、<code>message_id</code>、<code>parent_message_id</code></li>
+              <li><code>worker_id</code>、<code>source_agent_type</code>、<code>target_agent_type</code></li>
+              <li><code>status</code>、<code>timing</code>、<code>route</code>、<code>error</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3><span class="badge amber">SpanRecord</span></h3>
+            <p>trace 树节点，是 Redis spans、Langfuse observations、Phoenix OTel spans 的统一语义。</p>
+            <ul>
+              <li><code>span_id</code>、<code>parent_span_id</code>、<code>name</code>、<code>operation</code></li>
+              <li><code>component</code>、<code>kind</code>、<code>source</code></li>
+              <li><code>input</code>、<code>output</code>、<code>tokens</code>、<code>cost</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3><span class="badge red">EventRecord</span></h3>
+            <p>session data stream 事件，用于前端流式输出和 trace fallback。</p>
+            <ul>
+              <li><code>event_id</code>、<code>trace_id</code>、<code>session_id</code>、<code>message_id</code></li>
+              <li><code>event_type</code>、<code>content_type</code>、<code>timestamp</code></li>
+              <li><code>payload</code></li>
+            </ul>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr><th>字段</th><th>必须一致的原因</th><th>典型来源</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>trace_id</code></td>
+              <td>所有 spans、executions、events 归并到同一 trace 的主键。</td>
+              <td>Client 生成；worker、子 agent、外部应用继承。</td>
+            </tr>
+            <tr>
+              <td><code>message_id</code> / <code>parent_message_id</code></td>
+              <td>构建业务调用链和 resume 回调链。</td>
+              <td>AskAgentCommand / ResumeCommand header。</td>
+            </tr>
+            <tr>
+              <td><code>trace_parent_span_id</code></td>
+              <td>通用 OpenTelemetry 父 span，Phoenix 和其他 APM 依赖。</td>
+              <td>当前 OTel span 或 header metadata。</td>
+            </tr>
+            <tr>
+              <td><code>langfuse_parent_observation_id</code></td>
+              <td>Langfuse observation 层级父节点，必须指向正确 workflow/dispatch parent。</td>
+              <td>client.dispatch 或 agent.workflow observation。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="write">
+        <h2>写入路径</h2>
+        <div class="steps">
+          <details open>
+            <summary>1. Client dispatch 写入根信息</summary>
+            <div>
+              <p>
+                Python / Java client 发送 AskAgentCommand 时会写入 Redis trace meta、client.dispatch span，
+                并把 trace parent 信息放入 header。没有配置 Langfuse 时，client trace 写入应该 best-effort 跳过，
+                不能影响主流程。
+              </p>
+            </div>
+          </details>
+          <details>
+            <summary>2. Worker task start 创建 workflow 与 worker.execute</summary>
+            <div>
+              <p>
+                Langfuse 插件会创建 <code>agent.workflow:&lt;agent&gt;</code>、<code>worker.execute</code>、
+                <code>&lt;agent&gt;</code> 三层。workflow 用于跨异步流程；worker.execute 表示当前执行片段。
+              </p>
+            </div>
+          </details>
+          <details>
+            <summary>3. Agent emit / call_agent / dispatch_group 写 Redis spans</summary>
+            <div>
+              <p>
+                AgentContext 会记录 <code>agent.emit_chunk</code>、<code>agent.dispatch_group</code> 等 span。
+                <code>call_agent</code> 会优先传播 workflow observation id，避免异步 child 挂到已经结束的 task 下。
+              </p>
+            </div>
+          </details>
+          <details>
+            <summary>4. Task complete / error / cancel 写 output 与状态</summary>
+            <div>
+              <p>
+                完成、失败、取消都会更新 observation output 和 trace-level output。写入失败只记录 warning，
+                不抛到业务执行链路。
+              </p>
+            </div>
+          </details>
+        </div>
+
+        <h3>手动写入示例</h3>
+        <div class="code-tabs" data-tabs>
+          <div class="tab-buttons">
+            <button class="active" data-tab="write-trace">Trace</button>
+            <button data-tab="write-span">Span</button>
+            <button data-tab="write-event">Event</button>
+          </div>
+          <div class="tab-panel active" data-panel="write-trace">
+<pre><code>from by_framework.trace import TraceRecord, TraceWriteClient
+
+writer = TraceWriteClient()
+
+await writer.record_trace(
+    TraceRecord(
+        trace_id=header.trace_id,
+        name=f"client.dispatch:{header.target_agent_type}",
+        session_id=header.session_id,
+        root_message_id=header.message_id,
+        root_agent_type=header.target_agent_type,
+        input=command.content,
+        status="RUNNING",
+        start_ts=now_ms,
+    )
+)</code></pre>
+          </div>
+          <div class="tab-panel" data-panel="write-span">
+<pre><code>from by_framework.trace import SpanRecord, TraceWriteClient
+
+writer = TraceWriteClient()
+
+await writer.record_span(
+    SpanRecord(
+        trace_id=header.trace_id,
+        span_id="custom-step-1",
+        parent_span_id=header.trace_parent_span_id,
+        name="Knowledge_Retrieval",
+        operation="knowledge.retrieve",
+        component="external-worker",
+        kind="retriever",
+        start_ts=start_ms,
+        end_ts=end_ms,
+        input={"query": query},
+        output={"documents": len(docs)},
+        source="external",
+        session_id=header.session_id,
+        message_id=header.message_id,
+    )
+)</code></pre>
+          </div>
+          <div class="tab-panel" data-panel="write-event">
+<pre><code>from by_framework.trace import EventRecord, TraceWriteClient
+
+writer = TraceWriteClient()
+
+await writer.record_event(
+    EventRecord(
+        event_id="evt-001",
+        trace_id=header.trace_id,
+        session_id=header.session_id,
+        message_id=header.message_id,
+        event_type="chunk",
+        content_type="text",
+        timestamp=now_ms,
+        payload={"content": "partial answer"},
+    )
+)</code></pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="read">
+        <h2>读取 SDK</h2>
+        <p>
+          <code>by-framework-trace-query</code> 是 Dashboard 和外部查询工具的统一入口。
+          v1 source 是 Redis，后续可以扩展 Langfuse / Phoenix source。单个 source 失败时返回
+          <code>status=partial</code> 和 diagnostics，而不是让整体查询失败。
+        </p>
+        <div class="code-tabs" data-tabs>
+          <div class="tab-buttons">
+            <button class="active" data-tab="read-get">get_trace</button>
+            <button data-tab="read-list">list_traces</button>
+            <button data-tab="read-explain">explain_trace</button>
+          </div>
+          <div class="tab-panel active" data-panel="read-get">
+<pre><code>from by_framework_trace_query import TraceReadClient
+
+client = TraceReadClient()
+result = await client.get_trace(trace_id, session_id=session_id)
+
+print(result.status)
+print(result.trace.to_dict())
+print([span.to_dict() for span in result.spans])
+print([node.to_dict() for node in result.tree])</code></pre>
+          </div>
+          <div class="tab-panel" data-panel="read-list">
+<pre><code>from by_framework_trace_query import TraceReadClient
+
+client = TraceReadClient()
+
+by_session = await client.list_traces(session_id="sess-123", limit=20)
+by_worker = await client.list_traces(worker_id="worker-1", limit=20)
+by_agent = await client.list_traces(agent_type="weather-agent", limit=20)</code></pre>
+          </div>
+          <div class="tab-panel" data-panel="read-explain">
+<pre><code>from by_framework_trace_query import TraceReadClient
+
+client = TraceReadClient(max_spans=1000)
+explain = await client.explain_trace(trace_id, session_id=session_id)
+
+# diagnostics codes:
+# missing_client_dispatch, missing_worker_execute, missing_parent,
+# parent_cycle, trace_output_missing, span_count_exceeded, source_timeout
+print(explain)</code></pre>
+          </div>
+        </div>
+        <div class="grid-3">
+          <div class="card">
+            <h3>Redis Source</h3>
+            <p>读取 <code>trace_meta</code>、<code>trace_spans</code>、trace indexes；没有 stored spans 时从 session fallback 合成。</p>
+          </div>
+          <div class="card">
+            <h3>Trace Merger</h3>
+            <p>按 <code>span_id</code> 去重，保留 input/output/tokens/cost 更完整的 span，并构建树。</p>
+          </div>
+          <div class="card">
+            <h3>Diagnostics</h3>
+            <p>返回结构问题和 source 问题，帮助 Dashboard 明确是缺写入、缺 parent、循环还是部分读取。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="langfuse">
+        <h2>Langfuse / Phoenix 集成</h2>
+        <div class="grid-2">
+          <div class="card">
+            <h3>Langfuse</h3>
+            <p>
+              安装 <code>by-framework-trace-langfuse</code> 并配置环境变量后，Worker 启动时会自动发现
+              <code>LangfuseTraceProviderFactory</code>。插件会把 by-framework 的 trace id 转成 Langfuse 需要的
+              32 位 hex trace id，并使用 <code>parent_span_id</code> 连接 observation 层级。
+            </p>
+<pre><code>export BYAI_LANGFUSE_ENABLED=true
+export LANGFUSE_PUBLIC_KEY=pk-lf-...
+export LANGFUSE_SECRET_KEY=sk-lf-...
+export LANGFUSE_BASE_URL=http://localhost:3000</code></pre>
+          </div>
+          <div class="card">
+            <h3>Phoenix</h3>
+            <p>
+              安装 <code>by-framework-trace-phoenix</code> 后，通过 OpenTelemetry parent context 连接通用 span。
+              Phoenix 更适合查看 OTel 链路、OpenInference/LangChain/OpenAI instrumentation。
+            </p>
+<pre><code>export BYAI_PHOENIX_ENABLED=true
+export PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006/v1/traces
+export PHOENIX_PROJECT_NAME=by-framework</code></pre>
+          </div>
+        </div>
+        <p class="warning callout">
+          Langfuse 的 <code>observation.end()</code> 在当前 SDK 中不接受 <code>output=...</code> 参数。
+          by-framework 插件会兼容处理：能直接 end 就直接 end，否则先 update output 再 end。
+        </p>
+      </section>
+
+      <section id="usage">
+        <h2>接入方式</h2>
+        <div class="code-tabs" data-tabs>
+          <div class="tab-buttons">
+            <button class="active" data-tab="usage-worker">普通 Worker</button>
+            <button data-tab="usage-langgraph">LangGraph Worker</button>
+            <button data-tab="usage-external">外部应用</button>
+          </div>
+          <div class="tab-panel active" data-panel="usage-worker">
+<pre><code>from by_framework import AgentContext, GatewayWorker
+
+class MyWorker(GatewayWorker):
+    async def process_command(self, command, context: AgentContext):
+        await context.emit_chunk("starting")
+        result = await do_work(command.content)
+        await context.emit_chunk(result)
+        return result
+
+# 自动接入：
+# - header.trace_id 进入 context.trace_id
+# - worker.execute / agent.workflow 由插件写入
+# - emit_chunk / call_agent 写 Redis spans 和 session events</code></pre>
+          </div>
+          <div class="tab-panel" data-panel="usage-langgraph">
+<pre><code>class PlannerWorker(LangGraphWorker):
+    def get_thread_id(self, context):
+        # 推荐使用 message_id，避免同 session 下旧挂起状态串扰。
+        return context.message_id or context.session_id
+
+    def build_graph(self):
+        # make_remote_agent_tool 会通过 context.call_agent 派发子 agent。
+        # trace parent 会自动使用 agent.workflow observation。
+        ...
+
+# 时间语义：
+# - A initial worker.execute: 执行到 interrupt / QUEUED
+# - B worker.execute: 子 agent 实际耗时
+# - A resume worker.execute: 回调后继续执行
+# - agent.workflow:A: 覆盖完整逻辑流程</code></pre>
+          </div>
+          <div class="tab-panel" data-panel="usage-external">
+<pre><code>from langfuse import Langfuse
+from by_framework.trace import (
+    extract_external_trace_context,
+    start_langfuse_observation,
+    build_otel_parent_context,
+)
+from opentelemetry import trace
+
+ctx = extract_external_trace_context(command_dict)
+langfuse = Langfuse()
+
+obs = start_langfuse_observation(
+    langfuse,
+    command_dict,
+    name="external_plain_app",
+    as_type="span",
+    input_data=command_dict.get("content"),
+)
+
+tracer = trace.get_tracer("external-app")
+with tracer.start_as_current_span(
+    "external_plain_app",
+    context=build_otel_parent_context(command_dict),
+):
+    result = run_external_pipeline()
+
+obs.update(output=result)
+obs.end()</code></pre>
+          </div>
+        </div>
+        <h3>接入检查清单</h3>
+        <div class="checklist">
+          <div class="check"><div>所有派生 command 继承同一个 <code>trace_id</code>。</div></div>
+          <div class="check"><div>子任务设置 <code>parent_message_id</code> 为调用方 <code>message_id</code>。</div></div>
+          <div class="check"><div>OpenTelemetry 使用 <code>trace_parent_span_id</code> 作为父 span。</div></div>
+          <div class="check"><div>Langfuse 使用 <code>langfuse_parent_observation_id</code> 作为父 observation。</div></div>
+          <div class="check"><div>长流程使用 workflow span，单次执行使用 worker.execute span。</div></div>
+          <div class="check"><div>写入失败必须 best-effort，不影响业务主流程。</div></div>
+        </div>
+      </section>
+
+      <section id="dashboard">
+        <h2>Dashboard 与运行方式</h2>
+        <p>
+          Dashboard 已经独立为 <code>by-framework-dashboard</code> 子包。它通过
+          <code>TraceReadClient</code> 读取 trace，不直接耦合 Redis 查询细节。
+        </p>
+<pre><code>uv run --package by-framework-dashboard by-framework-dashboard \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --redis-host localhost \
+  --redis-port 6379 \
+  --redis-db 0</code></pre>
+        <table>
+          <thead><tr><th>接口</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td><code>/api/traces?session_id=...</code></td><td>按 session 列 trace summaries。</td></tr>
+            <tr><td><code>/api/traces?worker_id=...</code></td><td>按 worker index 列 trace summaries。</td></tr>
+            <tr><td><code>/api/traces?agent_type=...</code></td><td>按 agent index 列 trace summaries。</td></tr>
+            <tr><td><code>/api/trace/&lt;trace_id&gt;</code></td><td>读取单个 trace 的完整 tree/timeline。</td></tr>
+            <tr><td><code>/metrics</code></td><td>导出 Prometheus 格式指标。</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="diagnostics">
+        <h2>排查手册</h2>
+        <table>
+          <thead><tr><th>现象</th><th>优先检查</th><th>修复方向</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Langfuse 显示 Unnamed trace</td>
+              <td>client 是否写 client.dispatch；trace root 是否设置 trace name。</td>
+              <td>确认 client 侧 Langfuse 环境变量和 best-effort warning。</td>
+            </tr>
+            <tr>
+              <td>外部 app 节点和 worker.execute 同层</td>
+              <td><code>langfuse_parent_observation_id</code> 是否传给外部 app。</td>
+              <td>使用 <code>start_langfuse_observation()</code> 或手动设置 trace_context。</td>
+            </tr>
+            <tr>
+              <td>子节点耗时超过父节点</td>
+              <td>异步 child 是否挂到了已结束的 agent.task。</td>
+              <td>使用 <code>agent.workflow</code> 作为 call parent。</td>
+            </tr>
+            <tr>
+              <td>Dashboard trace 没有 spans</td>
+              <td>Redis <code>trace_spans</code> 是否有写入；session fallback 是否有 execution/event。</td>
+              <td>检查 <code>TraceReadClient.explain_trace()</code> diagnostics。</td>
+            </tr>
+            <tr>
+              <td>Java client trace 缺 client 信息</td>
+              <td>Java 是否同步了 Redis client.dispatch 写入和 Langfuse parent header。</td>
+              <td>确认 Java SDK 和 Python schema 字段一致。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="faq">
+        <h2>FAQ</h2>
+        <details open>
+          <summary>client 端默认会生成哪些 trace 字段？</summary>
+          <div>
+            <p>
+              client 会生成或继承 <code>trace_id</code>，并为下游设置 <code>trace_parent_span_id</code>。
+              如果 Langfuse 已配置并成功创建 client.dispatch observation，还会设置
+              <code>langfuse_parent_observation_id</code>。没有配置 Langfuse 时不应影响发送消息。
+            </p>
+          </div>
+        </details>
+        <details>
+          <summary>外部应用一定要使用 by-framework SDK 吗？</summary>
+          <div>
+            <p>
+              不一定。外部应用只要能拿到普通 AskAgentCommand 或 header dict，就可以用
+              <code>extract_external_trace_context()</code> 提取 trace join 参数，再接入 Langfuse 或 OpenTelemetry。
+            </p>
+          </div>
+        </details>
+        <details>
+          <summary>Redis Read SDK 和 Langfuse/Phoenix 的关系是什么？</summary>
+          <div>
+            <p>
+              Redis Read SDK 是 by-framework Dashboard 的 v1 查询事实源；Langfuse/Phoenix 是观测后端。
+              后续可以增加 LangfuseSource / PhoenixSource，把 tokens/cost/OTel latency 补充进统一结果。
+            </p>
+          </div>
+        </details>
+        <details>
+          <summary>为什么不让 Dashboard 直接查 Redis？</summary>
+          <div>
+            <p>
+              Dashboard 只做展示和 HTTP 兼容层。查询能力沉到 <code>by-framework-trace-query</code>，
+              这样 CLI、测试工具、外部服务也可以复用同一套读逻辑，并为多数据源高可用留出口。
+            </p>
+          </div>
+        </details>
+      </section>
+
+      <p class="footer">by-framework trace guide · self-contained HTML · no external dependencies</p>
+    </main>
+  </div>
+
+  <script>
+    (function () {
+      const tabGroups = document.querySelectorAll("[data-tabs]");
+      tabGroups.forEach((group) => {
+        const buttons = group.querySelectorAll("[data-tab]");
+        const panels = group.querySelectorAll("[data-panel]");
+        buttons.forEach((button) => {
+          button.addEventListener("click", () => {
+            const target = button.getAttribute("data-tab");
+            buttons.forEach((item) => item.classList.toggle("active", item === button));
+            panels.forEach((panel) => {
+              panel.classList.toggle("active", panel.getAttribute("data-panel") === target);
+            });
+          });
+        });
+      });
+
+      const links = Array.from(document.querySelectorAll("#toc a"));
+      const sections = links
+        .map((link) => document.querySelector(link.getAttribute("href")))
+        .filter(Boolean);
+      const activate = () => {
+        let current = sections[0];
+        for (const section of sections) {
+          if (section.getBoundingClientRect().top <= 120) current = section;
+        }
+        links.forEach((link) => {
+          link.classList.toggle("active", link.getAttribute("href") === "#" + current.id);
+        });
+      };
+      document.addEventListener("scroll", activate, { passive: true });
+      activate();
+    })();
+  </script>
+</body>
+</html>

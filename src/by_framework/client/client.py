@@ -43,7 +43,7 @@ from by_framework.core.protocol.responses import (
 )
 from by_framework.core.registry import WorkerRegistry
 from by_framework.errors import WorkerRegistryNotSetError
-from by_framework.observability.span_recorder import (
+from by_framework.trace.span_recorder import (
     SpanRecorder,
     TraceSpan,
     str_to_uint64,
@@ -688,7 +688,7 @@ class GatewayClient:
                     )
                 )
                 try:
-                    from by_framework.observability.metrics import record_availability_metrics
+                    from by_framework.metrics import record_availability_metrics
 
                     record_availability_metrics(
                         agent_type=params["target_agent_type"],

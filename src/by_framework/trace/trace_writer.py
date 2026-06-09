@@ -13,7 +13,6 @@ from by_framework.trace.span_recorder import (
     TRACE_TTL_SECONDS,
     RedisSpanExporter,
     SpanRecorder,
-    TraceSpan,
 )
 from by_framework.trace.trace_schema import (
     EventRecord,
@@ -91,43 +90,7 @@ class TraceWriteClient:
     async def record_span(self, record: SpanRecord) -> None:
         """Persist a trace-tree span."""
         try:
-            await self._span_recorder.record_span(
-                TraceSpan(
-                    trace_id=record.trace_id,
-                    span_id=record.span_id,
-                    parent_span_id=record.parent_span_id,
-                    operation=record.operation or record.name,
-                    component=record.component,
-                    start_ts=record.start_ts,
-                    end_ts=record.end_ts,
-                    status=record.status,
-                    name=record.name,
-                    kind=record.kind,
-                    source=record.source,
-                    input=record.input,
-                    output=record.output,
-                    tokens=record.tokens,
-                    cost=record.cost,
-                    session_id=record.session_id,
-                    execution_id=record.execution_id,
-                    message_id=record.message_id,
-                    parent_message_id=record.parent_message_id,
-                    worker_id=record.worker_id,
-                    source_agent_type=record.source_agent_type,
-                    target_agent_type=record.target_agent_type,
-                    error_type=record.error_type,
-                    error_message=record.error_message,
-                    error_code=record.error_code,
-                    failed_stage=record.failed_stage,
-                    retryable=record.retryable,
-                    route_policy=record.route_policy,
-                    route_status=record.route_status,
-                    queue_wait_ms=record.queue_wait_ms,
-                    chunk_count=record.chunk_count,
-                    event_type=record.event_type,
-                    metadata=record.metadata,
-                )
-            )
+            await self._span_recorder.record_span(record.to_trace_span())
         except Exception as err:  # pylint: disable=broad-exception-caught
             logger.warning("TraceWriteClient.record_span skipped: %s", err)
 

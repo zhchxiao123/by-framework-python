@@ -1084,7 +1084,14 @@ async def _get_trace_snapshot_via_read_sdk(
             _trace_read_client(redis_client).get_trace(trace_id, session_id=session_id),
             timeout=2.0,
         )
-        return trace_result_to_dashboard_trace(trace_result)
+        trace = trace_result_to_dashboard_trace(trace_result)
+        if trace.get("spans"):
+            return trace
+        return await build_trace_observability_snapshot(
+            redis_client,
+            trace_id,
+            session_id=session_id,
+        )
     except Exception as err:  # pylint: disable=broad-exception-caught
         logger.warning("TraceReadClient fallback for trace %s: %s", trace_id, err)
         return await build_trace_observability_snapshot(

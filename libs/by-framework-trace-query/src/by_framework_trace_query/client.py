@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from by_framework.trace import TraceDiagnostic, TraceReadResult
 
 from .merger import TraceMerger
@@ -88,10 +90,14 @@ class TraceReadClient:
                 seen.add(trace_id)
                 if len(trace_ids) >= limit:
                     break
-        return [
-            await self.get_trace(trace_id, session_id=session_id)
-            for trace_id in trace_ids[:limit]
-        ]
+        return list(
+            await asyncio.gather(
+                *[
+                    self.get_trace(trace_id, session_id=session_id)
+                    for trace_id in trace_ids[:limit]
+                ]
+            )
+        )
 
     async def explain_trace(
         self, trace_id: str, *, session_id: str = ""

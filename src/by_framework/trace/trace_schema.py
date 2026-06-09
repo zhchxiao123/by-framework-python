@@ -10,11 +10,7 @@ from by_framework.trace.span_recorder import _sanitize_value
 
 
 def _clean_dict(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in payload.items()
-        if value not in ("", None) and value is not False
-    }
+    return {key: value for key, value in payload.items() if value not in ("", None)}
 
 
 def _sanitize_mapping(mapping: dict[str, Any]) -> dict[str, Any]:
@@ -37,7 +33,11 @@ def decode_redis_value(value: Any) -> Any:
     stripped = value.strip()
     if not stripped:
         return ""
-    if stripped[0] not in '[{"' and stripped not in ("true", "false", "null"):
+    if stripped[0] not in '[{"-0123456789' and stripped not in (
+        "true",
+        "false",
+        "null",
+    ):
         return value
     try:
         return json.loads(stripped)
@@ -169,6 +169,46 @@ class SpanRecord:
                 "error_message", payload["error_message"]
             )
         return _clean_dict(payload)
+
+    def to_trace_span(self):
+        """Convert this public record to the internal TraceSpan exporter model."""
+        from by_framework.trace.span_recorder import TraceSpan
+
+        return TraceSpan(
+            trace_id=self.trace_id,
+            span_id=self.span_id,
+            parent_span_id=self.parent_span_id,
+            operation=self.operation or self.name,
+            component=self.component,
+            start_ts=self.start_ts,
+            end_ts=self.end_ts,
+            status=self.status,
+            name=self.name,
+            kind=self.kind,
+            source=self.source,
+            input=self.input,
+            output=self.output,
+            tokens=self.tokens,
+            cost=self.cost,
+            session_id=self.session_id,
+            execution_id=self.execution_id,
+            message_id=self.message_id,
+            parent_message_id=self.parent_message_id,
+            worker_id=self.worker_id,
+            source_agent_type=self.source_agent_type,
+            target_agent_type=self.target_agent_type,
+            error_type=self.error_type,
+            error_message=self.error_message,
+            error_code=self.error_code,
+            failed_stage=self.failed_stage,
+            retryable=self.retryable,
+            route_policy=self.route_policy,
+            route_status=self.route_status,
+            queue_wait_ms=self.queue_wait_ms,
+            chunk_count=self.chunk_count,
+            event_type=self.event_type,
+            metadata=self.metadata,
+        )
 
     @classmethod
     def from_mapping(

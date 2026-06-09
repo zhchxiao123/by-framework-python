@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
@@ -33,6 +35,7 @@ WORKER_EXECUTE_OBSERVATION_ATTR = "_langfuse_worker_execute_observation"
 LANGFUSE_PARENT_OBSERVATION_METADATA_KEY = "langfuse_parent_observation_id"
 _QUOTES_TO_STRIP = "\"'“”‘’"
 _FALSE_LIKE_VALUES = {"0", "false", "no", "off", "disabled"}
+_CLIENT_DISPATCH_TRACER_CACHE: dict[LangfuseConfig, "_SdkLangfuseTracer"] = {}
 
 
 @dataclass(frozen=True)
@@ -329,11 +332,16 @@ class LangfusePlugin(Plugin):
         observation_store: Optional[ObservationStore] = None,
         plugin_id: str = "langfuse",
         enabled: bool = True,
+        max_active_workflows: int = 10000,
     ):
         super().__init__(PluginManifest(plugin_id=plugin_id, enabled=enabled))
         self._tracer = tracer
         self._observation_store = observation_store
-        self._active_workflows: dict[tuple[str, str], ObservationHandle] = {}
+        self._active_workflows: OrderedDict[tuple[str, str], ObservationHandle] = (
+            OrderedDict()
+        )
+        self._max_active_workflows = max(1, int(max_active_workflows or 10000))
+        self._pending_trace_output_updates: set[asyncio.Future[Any]] = set()
 
     async def register_agent_configs(
         self, build_context: Any
@@ -352,6 +360,11 @@ class LangfusePlugin(Plugin):
 
     async def on_worker_shutdown(self, worker: Any) -> None:
         del worker
+        if self._pending_trace_output_updates:
+            await asyncio.gather(
+                *list(self._pending_trace_output_updates),
+                return_exceptions=True,
+            )
         if self._tracer is not None:
             self._tracer.shutdown()
 
@@ -396,6 +409,8 @@ class LangfusePlugin(Plugin):
         )
         workflow_key = (identity.session_id, identity.message_id)
         workflow_obs = self._active_workflows.get(workflow_key)
+        if workflow_obs is not None:
+            self._active_workflows.move_to_end(workflow_key)
         workflow_span_id = str_to_uint64(f"{execution_anchor}:agent.workflow")
         workflow_observation_id = f"{workflow_span_id:016x}"
 
@@ -418,6 +433,7 @@ class LangfusePlugin(Plugin):
             )
             if workflow_obs is not None:
                 self._active_workflows[workflow_key] = workflow_obs
+                self._evict_active_workflows_if_needed()
 
         worker_execute_obs = tracer.start_observation(
             _ObservationStartRequest(
@@ -686,6 +702,18 @@ class LangfusePlugin(Plugin):
         if self._active_workflows.get(key) is observation:
             self._active_workflows.pop(key, None)
 
+    def _evict_active_workflows_if_needed(self) -> None:
+        while len(self._active_workflows) > self._max_active_workflows:
+            _, observation = self._active_workflows.popitem(last=False)
+            try:
+                observation.update(
+                    level="WARNING",
+                    status_message="workflow evicted from active workflow cache",
+                )
+                observation.end()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+
     @staticmethod
     def _is_non_terminal_result(result: Any) -> bool:
         if not isinstance(result, dict):
@@ -704,7 +732,28 @@ class LangfusePlugin(Plugin):
 
         try:
             trace_id_hex = f"{str_to_uint128(trace_id):032x}"
-            tracer.update_trace_output(trace_id_hex, self._serialize_value(output))
+            serialized_output = self._serialize_value(output)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                tracer.update_trace_output(trace_id_hex, serialized_output)
+                return
+            future = loop.run_in_executor(
+                None,
+                tracer.update_trace_output,
+                trace_id_hex,
+                serialized_output,
+            )
+            self._pending_trace_output_updates.add(future)
+
+            def _discard_done(done: asyncio.Future[Any]) -> None:
+                self._pending_trace_output_updates.discard(done)
+                try:
+                    done.result()
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+
+            future.add_done_callback(_discard_done)
         except Exception:  # pylint: disable=broad-exception-caught
             pass
 
@@ -745,19 +794,23 @@ def start_client_dispatch_observation(
     except ImportError:
         return None
 
-    langfuse_client_cls = getattr(langfuse_module, "Langfuse")
-    try:
-        client = langfuse_client_cls(
-            public_key=config.public_key,
-            secret_key=config.secret_key,
-            base_url=config.base_url,
-        )
-    except TypeError:
-        client = langfuse_client_cls(
-            public_key=config.public_key,
-            secret_key=config.secret_key,
-            host=config.base_url,
-        )
+    tracer = _CLIENT_DISPATCH_TRACER_CACHE.get(config)
+    if tracer is None:
+        langfuse_client_cls = getattr(langfuse_module, "Langfuse")
+        try:
+            client = langfuse_client_cls(
+                public_key=config.public_key,
+                secret_key=config.secret_key,
+                base_url=config.base_url,
+            )
+        except TypeError:
+            client = langfuse_client_cls(
+                public_key=config.public_key,
+                secret_key=config.secret_key,
+                host=config.base_url,
+            )
+        tracer = _SdkLangfuseTracer(client, config)
+        _CLIENT_DISPATCH_TRACER_CACHE[config] = tracer
 
     trace_id_hex = f"{str_to_uint128(trace_id):032x}"
     dispatch_metadata = {
@@ -769,7 +822,7 @@ def start_client_dispatch_observation(
         "user_name": user_name,
         "header_metadata": LangfusePlugin._serialize_value(metadata or {}),
     }
-    return _SdkLangfuseTracer(client, config).start_observation(
+    return tracer.start_observation(
         _ObservationStartRequest(
             span_id=str_to_uint64(f"{message_id}:client.dispatch"),
             trace_id=trace_id_hex,

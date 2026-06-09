@@ -6,6 +6,7 @@ import contextvars
 import hashlib
 import json
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
@@ -125,6 +126,9 @@ _OBSERVABILITY_DIAGNOSTICS: dict[str, Any] = {
     "export_failures_total": 0,
     "export_failures_by_exporter": {},
 }
+_OBSERVABILITY_DIAGNOSTICS_LOCK = threading.Lock()
+_LANGFUSE_PROCESSOR_PROVIDER_IDS: set[int] = set()
+_LANGFUSE_PROCESSOR_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -171,38 +175,44 @@ def build_observability_config() -> ObservabilityConfig:
 
 def get_observability_diagnostics() -> dict[str, Any]:
     """Return trace exporter self-diagnostics."""
-    return {
-        "dropped_spans_total": int(_OBSERVABILITY_DIAGNOSTICS["dropped_spans_total"]),
-        "dropped_spans_by_reason": dict(
-            _OBSERVABILITY_DIAGNOSTICS["dropped_spans_by_reason"]
-        ),
-        "export_failures_total": int(
-            _OBSERVABILITY_DIAGNOSTICS["export_failures_total"]
-        ),
-        "export_failures_by_exporter": dict(
-            _OBSERVABILITY_DIAGNOSTICS["export_failures_by_exporter"]
-        ),
-    }
+    with _OBSERVABILITY_DIAGNOSTICS_LOCK:
+        return {
+            "dropped_spans_total": int(
+                _OBSERVABILITY_DIAGNOSTICS["dropped_spans_total"]
+            ),
+            "dropped_spans_by_reason": dict(
+                _OBSERVABILITY_DIAGNOSTICS["dropped_spans_by_reason"]
+            ),
+            "export_failures_total": int(
+                _OBSERVABILITY_DIAGNOSTICS["export_failures_total"]
+            ),
+            "export_failures_by_exporter": dict(
+                _OBSERVABILITY_DIAGNOSTICS["export_failures_by_exporter"]
+            ),
+        }
 
 
 def reset_observability_diagnostics() -> None:
     """Reset trace exporter self-diagnostics for tests."""
-    _OBSERVABILITY_DIAGNOSTICS["dropped_spans_total"] = 0
-    _OBSERVABILITY_DIAGNOSTICS["dropped_spans_by_reason"] = {}
-    _OBSERVABILITY_DIAGNOSTICS["export_failures_total"] = 0
-    _OBSERVABILITY_DIAGNOSTICS["export_failures_by_exporter"] = {}
+    with _OBSERVABILITY_DIAGNOSTICS_LOCK:
+        _OBSERVABILITY_DIAGNOSTICS["dropped_spans_total"] = 0
+        _OBSERVABILITY_DIAGNOSTICS["dropped_spans_by_reason"] = {}
+        _OBSERVABILITY_DIAGNOSTICS["export_failures_total"] = 0
+        _OBSERVABILITY_DIAGNOSTICS["export_failures_by_exporter"] = {}
 
 
 def _record_drop(reason: str) -> None:
-    _OBSERVABILITY_DIAGNOSTICS["dropped_spans_total"] += 1
-    by_reason = _OBSERVABILITY_DIAGNOSTICS["dropped_spans_by_reason"]
-    by_reason[reason] = int(by_reason.get(reason, 0)) + 1
+    with _OBSERVABILITY_DIAGNOSTICS_LOCK:
+        _OBSERVABILITY_DIAGNOSTICS["dropped_spans_total"] += 1
+        by_reason = _OBSERVABILITY_DIAGNOSTICS["dropped_spans_by_reason"]
+        by_reason[reason] = int(by_reason.get(reason, 0)) + 1
 
 
 def _record_export_failure(exporter_name: str) -> None:
-    _OBSERVABILITY_DIAGNOSTICS["export_failures_total"] += 1
-    by_exporter = _OBSERVABILITY_DIAGNOSTICS["export_failures_by_exporter"]
-    by_exporter[exporter_name] = int(by_exporter.get(exporter_name, 0)) + 1
+    with _OBSERVABILITY_DIAGNOSTICS_LOCK:
+        _OBSERVABILITY_DIAGNOSTICS["export_failures_total"] += 1
+        by_exporter = _OBSERVABILITY_DIAGNOSTICS["export_failures_by_exporter"]
+        by_exporter[exporter_name] = int(by_exporter.get(exporter_name, 0)) + 1
 
 
 def _clean_env(value: str | None) -> str:
@@ -326,11 +336,7 @@ class TraceSpan:
             )
         if payload.get("metadata"):
             payload["metadata"] = _sanitize_value("metadata", payload["metadata"])
-        return {
-            key: value
-            for key, value in payload.items()
-            if value not in ("", None) and value is not False
-        }
+        return {key: value for key, value in payload.items() if value not in ("", None)}
 
 
 @runtime_checkable
@@ -696,30 +702,18 @@ def register_langfuse_span_processor() -> None:
         if secret_key and public_key and base_url:
             # 1. Ensure the global TracerProvider exists and patch the ID generator.
             provider = trace.get_tracer_provider()
-            if hasattr(provider, "_delegate") and provider._delegate is not None:
-                provider = provider._delegate
-
             if not isinstance(provider, TracerProvider):
                 provider = TracerProvider()
                 trace.set_tracer_provider(provider)
                 configure_otel_id_generator()
 
-            # 2. Avoid registering duplicate LangfuseSpanProcessor instances.
-            has_processor = False
-            active_processor = getattr(provider, "_active_span_processor", None)
-            if active_processor is not None:
-                processors = []
-                if hasattr(active_processor, "_span_processors"):
-                    processors = active_processor._span_processors
-                else:
-                    processors = [active_processor]
+            # 2. Avoid duplicate registration from this integration without
+            # relying on OpenTelemetry SDK private provider internals.
+            provider_id = id(provider)
+            with _LANGFUSE_PROCESSOR_LOCK:
+                if provider_id in _LANGFUSE_PROCESSOR_PROVIDER_IDS:
+                    return
 
-                for p in processors:
-                    if p.__class__.__name__ == "LangfuseSpanProcessor":
-                        has_processor = True
-                        break
-
-            if not has_processor:
                 # 3. Dynamically import and attach LangfuseSpanProcessor.
                 langfuse_processor_mod = import_module(
                     "langfuse._client.span_processor"
@@ -754,6 +748,7 @@ def register_langfuse_span_processor() -> None:
                     should_export_span=should_export_span,
                 )
                 provider.add_span_processor(processor)
+                _LANGFUSE_PROCESSOR_PROVIDER_IDS.add(provider_id)
                 logger.info(
                     "LangfuseSpanProcessor registered successfully to global OTel "
                     "TracerProvider. Base URL: %s",

@@ -1,8 +1,10 @@
 """Tests for the trace write schema and trace query SDK."""
 
+import asyncio
 import http.client
 import json
 import threading
+import time
 from http.server import ThreadingHTTPServer
 
 import pytest
@@ -19,6 +21,7 @@ from by_framework.trace import (
     TraceRecord,
     TraceWriteClient,
 )
+from by_framework.trace.trace_schema import decode_redis_value
 
 
 class FailingRedis:
@@ -51,6 +54,44 @@ class FailingTraceSource:
     ):
         del session_id, worker_id, agent_type, limit
         raise RuntimeError("source unavailable")
+
+
+class SlowTraceSource:
+    """Trace source fake used to verify list_traces reads details concurrently."""
+
+    name = "slow"
+
+    async def list_trace_ids(
+        self, *, session_id="", worker_id="", agent_type="", limit=50
+    ):
+        del session_id, worker_id, agent_type, limit
+        return ["trace-1", "trace-2", "trace-3"]
+
+    async def get_trace(self, trace_id, *, session_id=""):
+        del session_id
+        await asyncio.sleep(0.1)
+        return (
+            TraceRecord(trace_id=trace_id, output={"ok": True}),
+            [
+                SpanRecord(
+                    trace_id=trace_id,
+                    span_id=f"{trace_id}-client",
+                    operation="client.dispatch",
+                    component="client",
+                    start_ts=1,
+                    end_ts=2,
+                ),
+                SpanRecord(
+                    trace_id=trace_id,
+                    span_id=f"{trace_id}-worker",
+                    operation="worker.execute",
+                    component="worker",
+                    start_ts=2,
+                    end_ts=3,
+                ),
+            ],
+            [],
+        )
 
 
 class QueryPipeline:
@@ -190,6 +231,50 @@ def test_trace_records_are_json_serializable_and_redact_metadata():
     encoded = json.dumps(payload, ensure_ascii=False)
     assert "trace-1" in encoded
     assert payload["trace"]["metadata"]["api_key"] == "[REDACTED]"
+
+
+def test_trace_schema_decodes_json_numbers_and_preserves_false_values():
+    """Redis decoding should round-trip JSON primitives without type drift."""
+    assert decode_redis_value("1234") == 1234
+    assert decode_redis_value("-12.5") == -12.5
+    assert decode_redis_value("false") is False
+
+    span = SpanRecord(
+        trace_id="trace-1",
+        span_id="span-1",
+        operation="worker.execute",
+        component="worker",
+        retryable=False,
+    )
+
+    assert span.to_dict()["retryable"] is False
+
+
+def test_span_record_converts_to_trace_span_without_manual_field_mapping():
+    """SpanRecord owns the TraceSpan conversion used by write clients."""
+    record = SpanRecord(
+        trace_id="trace-1",
+        span_id="span-1",
+        parent_span_id="parent",
+        name="worker.execute",
+        operation="worker.execute",
+        component="worker",
+        kind="internal",
+        input={"prompt": "hi"},
+        output={"answer": "ok"},
+        tokens={"input": 1},
+        cost={"total": 0.01},
+        retryable=False,
+        metadata={"safe": "value"},
+    )
+
+    trace_span = record.to_trace_span()
+
+    assert trace_span.trace_id == record.trace_id
+    assert trace_span.parent_span_id == "parent"
+    assert trace_span.input == {"prompt": "hi"}
+    assert trace_span.retryable is False
+    assert trace_span.to_payload()["retryable"] is False
 
 
 @pytest.mark.asyncio
@@ -538,6 +623,23 @@ async def test_trace_read_client_lists_traces_by_session_index():
     )
 
     assert [result.trace.trace_id for result in traces] == ["trace-2", "trace-1"]
+
+
+@pytest.mark.asyncio
+async def test_trace_read_client_lists_trace_details_concurrently():
+    """Trace list details should be fetched concurrently, not one by one."""
+    client = TraceReadClient(sources=[SlowTraceSource()])
+
+    started = time.perf_counter()
+    traces = await client.list_traces(session_id="session-1", limit=3)
+    elapsed = time.perf_counter() - started
+
+    assert [result.trace.trace_id for result in traces] == [
+        "trace-1",
+        "trace-2",
+        "trace-3",
+    ]
+    assert elapsed < 0.2
 
 
 @pytest.mark.asyncio

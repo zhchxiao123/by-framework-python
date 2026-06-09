@@ -1,4 +1,5 @@
 import sys
+import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -61,6 +62,14 @@ class FakeTracer:
 
     def update_trace_output(self, trace_id: str, output: Any) -> None:
         self.trace_output_updates.append({"trace_id": trace_id, "output": output})
+
+
+class SlowTraceOutputTracer(FakeTracer):
+    """Tracer double whose trace output update would block if called inline."""
+
+    def update_trace_output(self, trace_id: str, output: Any) -> None:
+        time.sleep(0.2)
+        super().update_trace_output(trace_id, output)
 
 
 class EndWithoutKwargsObservation:
@@ -717,6 +726,71 @@ def test_langfuse_plugin_end_falls_back_to_update_then_plain_end():
 
     assert observation.updates[-1] == {"output": {"status": "ok"}}
     assert observation.end_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_langfuse_trace_output_update_does_not_block_task_complete():
+    """Trace-level output writes should not block the async worker event loop."""
+    tracer = SlowTraceOutputTracer()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=FakeObservationStore())
+    context = _build_context()
+
+    await plugin.on_task_start(context)
+    started = time.perf_counter()
+    await plugin.on_task_complete(context, {"answer": "done"})
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.1
+
+
+def test_start_client_dispatch_observation_reuses_langfuse_client(monkeypatch):
+    """Client dispatch tracing should not instantiate a Langfuse SDK per message."""
+    instances: list[Any] = []
+
+    class FakeLangfuseClient:
+        def __init__(self, **kwargs: Any):
+            self.kwargs = kwargs
+            instances.append(self)
+
+        def start_observation(self, **kwargs: Any):
+            del kwargs
+            return FakeSdkObservation()
+
+    fake_module = SimpleNamespace(Langfuse=FakeLangfuseClient)
+    monkeypatch.setitem(sys.modules, "langfuse", fake_module)
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "http://localhost:3000")
+
+    for idx in range(2):
+        langfuse_module.start_client_dispatch_observation(
+            trace_id="trace-client",
+            message_id=f"msg-{idx}",
+            target_agent_type="planner",
+            session_id="session-1",
+            content="hello",
+        )
+
+    assert len(instances) == 1
+
+
+@pytest.mark.asyncio
+async def test_langfuse_plugin_limits_active_workflow_cache():
+    """Long-running workers should cap active workflow handles."""
+    tracer = FakeTracer()
+    plugin = LangfusePlugin(
+        tracer=tracer,
+        observation_store=FakeObservationStore(),
+        max_active_workflows=2,
+    )
+
+    for idx in range(3):
+        context = _build_context(message_id=f"msg-{idx}")
+        await plugin.on_task_start(context)
+        await plugin.on_task_complete(context, {"status": "QUEUED"})
+
+    assert len(plugin._active_workflows) == 2  # pylint: disable=protected-access
+    assert ("session-1", "msg-0") not in plugin._active_workflows  # pylint: disable=protected-access
 
 
 def test_langfuse_trace_provider_factory_builds_plugin_from_env(monkeypatch):

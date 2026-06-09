@@ -113,7 +113,7 @@ async def test_phoenix_plugin_child_agent_parent_span_id_from_header_attr():
 
 @pytest.mark.asyncio
 async def test_phoenix_plugin_top_level_resume_ignores_parent_span_id_from_metadata():
-    """Top-level resumed tasks ignore trace_parent_span_id to avoid self-parent loops."""
+    """Top-level resumes ignore trace_parent_span_id self-parent loops."""
     mock_tracer = MagicMock()
     plugin = PhoenixPlugin(config=PhoenixConfig(enabled=True))
     plugin._tracer = mock_tracer

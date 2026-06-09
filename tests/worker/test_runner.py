@@ -21,6 +21,7 @@ from by_framework.core.protocol.message_header import MessageHeader
 
 
 class MockRedisRunner:
+
     def __init__(self, message_to_return):
         self.msg = message_to_return
         self.called_xreadgroup = False
@@ -45,6 +46,7 @@ class MockRedisRunner:
 
 
 class DummyWorker(GatewayWorker):
+
     def __init__(self):
         super().__init__("worker-1", None, None, None)
         self.processed = False
@@ -61,6 +63,7 @@ class DummyWorker(GatewayWorker):
 
 
 class ExecutionInspectWorker(DummyWorker):
+
     def __init__(self):
         super().__init__()
         self.seen_execution = None
@@ -71,6 +74,7 @@ class ExecutionInspectWorker(DummyWorker):
 
 
 class MultiCapWorker(GatewayWorker):
+
     def __init__(self):
         super().__init__("worker-multi", None, None, None)
 
@@ -82,11 +86,13 @@ class MultiCapWorker(GatewayWorker):
 
 
 class DuplicateIdRegistry:
+
     async def claim_worker_id(self, worker_id: str):
         raise ValueError(f"worker_id already in use: {worker_id}")
 
 
 class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
+
     async def test_runner_pull_and_dispatch(self):
         """Test that WorkerRunner pulls a message and dispatches it to the worker."""
         mock_msg = AskAgentCommand(
@@ -463,6 +469,7 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         cancel_event = asyncio.Event()
 
         class FakeTask:
+
             def __init__(self):
                 self.cancel_called = False
 

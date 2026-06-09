@@ -1,6 +1,6 @@
 """Serve the built-in observability dashboard."""
 
-# pylint: disable=line-too-long,inconsistent-quotes,invalid-name
+# pylint: disable=line-too-long,inconsistent-quotes,invalid-name,too-many-lines
 
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ from by_framework.metrics.snapshot import (
     load_history_from_redis,
     save_history_point_to_redis,
 )
+
 from by_framework_dashboard.adapters import (
     trace_result_to_dashboard_summary,
     trace_result_to_dashboard_trace,
@@ -899,9 +900,7 @@ def make_handler(
                         build_observability_diagnostics_metrics,
                         generate_latest_metrics,
                     )
-                    from by_framework.trace.span_recorder import (
-                        get_observability_diagnostics,
-                    )
+                    from by_framework.trace.span_recorder import get_observability_diagnostics
 
                     body, content_type = serialize_text(
                         build_prometheus_metrics(snapshot)

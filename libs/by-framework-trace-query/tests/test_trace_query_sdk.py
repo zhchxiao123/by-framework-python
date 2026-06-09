@@ -8,11 +8,6 @@ import time
 from http.server import ThreadingHTTPServer
 
 import pytest
-from by_framework_dashboard.adapters import trace_result_to_dashboard_trace
-from by_framework_dashboard.dashboard import make_handler
-from by_framework_trace_query import TraceReadClient
-from by_framework_trace_query.merger import TraceMerger
-
 from by_framework import RedisKeys
 from by_framework.trace import (
     EventRecord,
@@ -22,6 +17,11 @@ from by_framework.trace import (
     TraceWriteClient,
 )
 from by_framework.trace.trace_schema import decode_redis_value
+from by_framework_dashboard.adapters import trace_result_to_dashboard_trace
+from by_framework_dashboard.dashboard import make_handler
+
+from by_framework_trace_query import TraceReadClient
+from by_framework_trace_query.merger import TraceMerger
 
 
 class FailingRedis:

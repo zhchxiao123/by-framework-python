@@ -31,7 +31,10 @@ class TraceMerger:
             merged_diagnostics.append(
                 TraceDiagnostic(
                     code="span_count_exceeded",
-                    message=f"Trace has {len(deduped)} spans, over limit {self.max_spans}.",
+                    message=(
+                        f"Trace has {len(deduped)} spans, "
+                        f"over limit {self.max_spans}."
+                    ),
                     severity="warning",
                 )
             )

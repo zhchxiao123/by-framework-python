@@ -7,6 +7,16 @@ dependencies = [
     "by-framework>=0.2.1",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "isort>=5.13.0",
+    "pyink>=24.0.0",
+    "pylint>=3.0.0",
+    "ruff>=0.3.0",
+]
+
 [tool.uv.sources]
 by-framework = { workspace = true }
 

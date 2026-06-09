@@ -14,7 +14,7 @@ from by_framework.core.protocol.commands import (
     command_from_dict,
 )
 from by_framework.core.protocol.data_message import DataMessage
-from by_framework.core.protocol.message import BaiYingMessage, BaiYingMessageRole
+from by_framework.core.protocol.message import (BaiYingMessage, BaiYingMessageRole)
 from by_framework.errors import WorkerRegistryNotSetError
 from by_framework.trace.span_recorder import str_to_uint64
 

@@ -16,7 +16,7 @@ from by_framework.common.logger import logger
 from by_framework.core.protocol.agent_state import AgentState
 from by_framework.core.protocol.commands import ResumeCommand
 from by_framework.core.protocol.events import StreamChunkEvent
-from by_framework.trace.span_recorder import (str_to_uint64, str_to_uint128)
+from by_framework.trace.span_recorder import str_to_uint64, str_to_uint128
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
@@ -184,7 +184,7 @@ class LangGraphAdapter:
                         ),
                     )
 
-                    # Use a stable logical ID from metadata if available, fallback to run_id
+                    # Use stable metadata when available, otherwise fall back.
                     stable_id = (
                         event.get("metadata", {}).get("tool_call_id")
                         or event.get("metadata", {}).get("checkpoint_ns")

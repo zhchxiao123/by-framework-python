@@ -1,6 +1,8 @@
 """Tests for trace span recording configuration and safety controls."""
 
 import json
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -150,7 +152,17 @@ def test_observability_config_enables_otel_only_when_requested(monkeypatch):
     monkeypatch.setenv("BY_FRAMEWORK_OTEL_ENABLED", "true")
     monkeypatch.delenv("BY_FRAMEWORK_OBSERVABILITY_ENABLED", raising=False)
 
-    with patch("opentelemetry.trace", object()):
+    mock_trace = MagicMock()
+    mock_trace.get_tracer.return_value = MagicMock()
+    mock_otel_module = types.ModuleType("opentelemetry")
+    mock_otel_module.trace = mock_trace
+    with patch.dict(
+        sys.modules,
+        {
+            "opentelemetry": mock_otel_module,
+            "opentelemetry.trace": mock_trace,
+        },
+    ):
         recorder = SpanRecorder(redis_client=MagicMock())
 
     assert any(
@@ -194,6 +206,7 @@ async def test_span_recorder_records_export_failures():
     span_module.reset_observability_diagnostics()
 
     class FailingExporter:
+
         async def export_span(self, span):
             del span
             raise RuntimeError("backend unavailable")

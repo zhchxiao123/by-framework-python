@@ -433,7 +433,7 @@ async def test_resume_uses_distinct_span_ids_to_avoid_parent_cycles():
 
 
 @pytest.mark.asyncio
-async def test_resume_uses_callback_parent_message_when_context_parent_is_restored_root():
+async def test_resume_uses_callback_parent_when_context_parent_is_root():
     """Resume callbacks should use the callback header parent for trace nesting.
 
     WorkerRunner restores the original execution's parent_message_id onto
@@ -687,6 +687,7 @@ def test_langfuse_plugin_builds_sdk_client_with_constructor(monkeypatch):
     captured: dict[str, Any] = {}
 
     class FakeLangfuseClient:
+
         def __init__(self, **kwargs: Any):
             captured.update(kwargs)
 
@@ -748,6 +749,7 @@ def test_start_client_dispatch_observation_reuses_langfuse_client(monkeypatch):
     instances: list[Any] = []
 
     class FakeLangfuseClient:
+
         def __init__(self, **kwargs: Any):
             self.kwargs = kwargs
             instances.append(self)

@@ -8,8 +8,8 @@ from typing import Any
 from by_framework.common.constants import RedisKeys
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.registry import WorkerRegistry
-from by_framework.trace import SpanRecord, TraceDiagnostic, TraceRecord
 from by_framework.metrics.snapshot import build_trace_observability_snapshot
+from by_framework.trace import SpanRecord, TraceDiagnostic, TraceRecord
 
 
 class RedisTraceSource:

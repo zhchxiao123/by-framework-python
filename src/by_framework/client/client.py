@@ -43,11 +43,7 @@ from by_framework.core.protocol.responses import (
 )
 from by_framework.core.registry import WorkerRegistry
 from by_framework.errors import WorkerRegistryNotSetError
-from by_framework.trace.span_recorder import (
-    SpanRecorder,
-    TraceSpan,
-    str_to_uint64,
-)
+from by_framework.trace.span_recorder import (SpanRecorder, TraceSpan, str_to_uint64)
 
 if TYPE_CHECKING:
     pass

@@ -1073,10 +1073,7 @@ class AgentContext:
             import os
             from importlib import import_module
 
-            from by_framework.trace.span_recorder import (
-                str_to_uint64,
-                str_to_uint128,
-            )
+            from by_framework.trace.span_recorder import (str_to_uint64, str_to_uint128)
 
             def clean(val):
                 return val.strip().strip("'\"“”‘’") if val else ""

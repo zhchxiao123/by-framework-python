@@ -82,6 +82,10 @@ lint-changed:
 
 test:
 	@set -e; for project in $(PROJECTS); do \
+		if ! find "$$project/tests" -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit 2>/dev/null | grep -q .; then \
+			echo "==> Skipping $$project (no test files)"; \
+			continue; \
+		fi; \
 		echo "==> Testing $$project"; \
 		(cd $$project && uv run --extra dev pytest); \
 	done

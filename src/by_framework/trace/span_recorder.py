@@ -11,7 +11,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
 from inspect import isawaitable
-from typing import Any, AsyncIterator, Optional, Protocol, Sequence, runtime_checkable
+from typing import (Any, AsyncIterator, Optional, Protocol, Sequence, runtime_checkable)
 
 from by_framework.common.constants import RedisKeys
 from by_framework.common.logger import logger
@@ -78,7 +78,27 @@ try:
 except ImportError:
 
     class ContextIdGenerator:  # type: ignore
-        pass
+        """Fallback ID generator used when OpenTelemetry is not installed."""
+
+        def generate_trace_id(self) -> int:
+            """Return a context-provided or random 128-bit trace id."""
+            val = current_trace_id_var.get()
+            if val is not None:
+                return val
+            import secrets
+
+            val_rand = secrets.randbits(128)
+            return val_rand if val_rand != 0 else 1
+
+        def generate_span_id(self) -> int:
+            """Return a context-provided or random 64-bit span id."""
+            val = current_span_id_var.get()
+            if val is not None:
+                return val
+            import secrets
+
+            val_rand = secrets.randbits(64)
+            return val_rand if val_rand != 0 else 1
 
 
 def configure_otel_id_generator() -> None:

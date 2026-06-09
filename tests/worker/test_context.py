@@ -1,5 +1,7 @@
 import asyncio
 import json
+import sys
+import types
 from unittest.mock import AsyncMock
 
 import pytest
@@ -8,13 +10,14 @@ from by_framework import AgentContext
 from by_framework.core.extensions.plugin import Plugin, PluginManifest
 from by_framework.core.extensions.registry import PluginRegistry
 from by_framework.core.protocol.byai_codec import ByaiContentCodec
-from by_framework.core.protocol.commands import AskAgentCommand, command_from_dict
+from by_framework.core.protocol.commands import (AskAgentCommand, command_from_dict)
 from by_framework.core.protocol.event_type import EventType
-from by_framework.core.protocol.message import BaiYingMessage, BaiYingMessageRole
+from by_framework.core.protocol.message import (BaiYingMessage, BaiYingMessageRole)
 from by_framework.trace.span_recorder import str_to_uint64
 
 
 class RecordingCallAgentPlugin(Plugin):
+
     def __init__(self):
         super().__init__(PluginManifest(plugin_id="recording-call-agent"))
         self.events: list[tuple[str, str, str]] = []
@@ -35,6 +38,7 @@ class RecordingCallAgentPlugin(Plugin):
 
 
 class DenyAllPolicy:
+
     def check(
         self,
         operation: str,
@@ -160,10 +164,16 @@ async def test_context_call_agent_propagates_current_otel_span_id(monkeypatch):
             self.span_id = span_id_value
 
     class FakeSpan:
+
         def get_span_context(self):
             return FakeSpanContext(span_id)
 
-    monkeypatch.setattr("opentelemetry.trace.get_current_span", FakeSpan)
+    mock_trace = types.ModuleType("opentelemetry.trace")
+    mock_trace.get_current_span = FakeSpan
+    mock_otel_module = types.ModuleType("opentelemetry")
+    mock_otel_module.trace = mock_trace
+    monkeypatch.setitem(sys.modules, "opentelemetry", mock_otel_module)
+    monkeypatch.setitem(sys.modules, "opentelemetry.trace", mock_trace)
 
     await ctx.call_agent(target_agent_type="test", content="hello")
 

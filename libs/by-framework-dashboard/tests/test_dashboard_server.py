@@ -7,6 +7,7 @@ import threading
 from http.server import ThreadingHTTPServer
 
 import pytest
+from by_framework.metrics.snapshot import build_demo_observability_snapshot
 
 from by_framework_dashboard.dashboard import (
     DashboardAsyncRunner,
@@ -18,7 +19,6 @@ from by_framework_dashboard.dashboard import (
     serialize_json,
     serialize_text,
 )
-from by_framework.metrics.snapshot import build_demo_observability_snapshot
 
 
 def test_read_static_asset_loads_dashboard_index():
@@ -345,6 +345,7 @@ async def test_trace_fallback_routing(monkeypatch):
 
     # Mock httpx.AsyncClient
     class FakeAsyncClient:
+
         def __init__(self, *args, **kwargs):
             pass
 

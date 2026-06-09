@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from by_framework.trace import TraceReadResult
 from by_framework.metrics.snapshot import _build_trace_snapshot
+from by_framework.trace import TraceReadResult
 
 
 def trace_result_to_dashboard_trace(result: TraceReadResult) -> dict[str, Any]:

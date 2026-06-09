@@ -2,6 +2,7 @@
 
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${1:-}"
 shift || true
 
@@ -97,7 +98,7 @@ run_for_project() {
   else
     (
       cd "$project"
-      uv run --extra dev pylint "${targets[@]}"
+      uv run --extra dev pylint --rcfile "$ROOT_DIR/pylintrc" "${targets[@]}"
       uv run --extra dev ruff check "${targets[@]}"
     )
   fi

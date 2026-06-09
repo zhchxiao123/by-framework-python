@@ -264,8 +264,9 @@ class _SdkLangfuseTracer:
                     }
                 ]
             }
+            base_url = self._config.base_url.rstrip("/")
             response = httpx.post(
-                f"{self._config.base_url.rstrip('/')}/api/public/ingestion",
+                f"{base_url}/api/public/ingestion",
                 json=payload,
                 auth=(self._config.public_key, self._config.secret_key),
                 headers={

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import by_framework.worker.context as context_module
 from by_framework import AgentContext
 from by_framework.core.extensions.plugin import Plugin, PluginManifest
 from by_framework.core.extensions.registry import PluginRegistry
@@ -74,7 +75,13 @@ async def test_context_call_agent_with_metadata():
     args, _ = mock_redis.xadd.call_args
     data = json.loads(args[1]["data"])
     command = command_from_dict(data)
-    assert command.header.metadata == {"ctx": "val"}
+    assert command.header.metadata["ctx"] == "val"
+    assert command.header.metadata["framework_parent_span_id"] == (
+        f"{command.header.message_id}:client.dispatch"
+    )
+    assert command.header.metadata["trace_parent_span_id"] == (
+        command.header.trace_parent_span_id
+    )
 
 
 @pytest.mark.asyncio
@@ -138,6 +145,132 @@ async def test_context_call_agent_prefers_langfuse_call_parent_observation_id():
     data = json.loads(args[1]["data"])
     command = command_from_dict(data)
     assert command.header.langfuse_parent_observation_id == "workflow-obs"
+
+
+@pytest.mark.asyncio
+async def test_context_call_agent_prefers_current_langfuse_tool_observation(
+    monkeypatch,
+):
+    """LangGraph tool calls should parent remote calls to the active tool span."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.execute = AsyncMock(return_value=[])
+    mock_redis.pipeline.return_value = mock_pipe
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.zrangebyscore = AsyncMock(return_value=[b"worker-1"])
+    mock_redis.get = AsyncMock(return_value=b"1")
+
+    ctx = AgentContext(session_id="s1", trace_id="trace-tool", redis_client=mock_redis)
+
+    class FakeLangfuseClient:
+
+        @staticmethod
+        def get_current_observation_id():
+            return "obs-query-weather"
+
+    class FakeSpanContext:
+        is_valid = True
+        span_id = str_to_uint64("langgraph-parent")
+
+    class FakeSpan:
+
+        @staticmethod
+        def get_span_context():
+            return FakeSpanContext()
+
+    mock_trace = types.ModuleType("opentelemetry.trace")
+    mock_trace.get_current_span = FakeSpan
+    mock_otel_module = types.ModuleType("opentelemetry")
+    mock_otel_module.trace = mock_trace
+    mock_langfuse = types.ModuleType("langfuse")
+
+    def get_langfuse_client():
+        return FakeLangfuseClient()
+
+    mock_langfuse.get_client = get_langfuse_client
+
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "http://localhost:3000")
+    monkeypatch.setattr(context_module, "_LANGFUSE_CURRENT_OBSERVATION_GETTER", None)
+    monkeypatch.setitem(sys.modules, "opentelemetry", mock_otel_module)
+    monkeypatch.setitem(sys.modules, "opentelemetry.trace", mock_trace)
+    monkeypatch.setitem(sys.modules, "langfuse", mock_langfuse)
+
+    await ctx.call_agent(target_agent_type="weather-agent", content="weather")
+
+    args, _ = mock_redis.xadd.call_args
+    data = json.loads(args[1]["data"])
+    command = command_from_dict(data)
+    assert command.header.langfuse_parent_observation_id == "obs-query-weather"
+
+
+def test_context_current_langfuse_observation_getter_is_cached(monkeypatch):
+    """Langfuse module/client lookup is cached across calls."""
+    get_client_calls = 0
+    get_observation_calls = 0
+
+    class FakeLangfuseClient:
+
+        @staticmethod
+        def get_current_observation_id():
+            nonlocal get_observation_calls
+            get_observation_calls += 1
+            return "obs-tool"
+
+    mock_langfuse = types.ModuleType("langfuse")
+
+    def get_langfuse_client():
+        nonlocal get_client_calls
+        get_client_calls += 1
+        return FakeLangfuseClient()
+
+    mock_langfuse.get_client = get_langfuse_client
+
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "http://localhost:3000")
+    monkeypatch.setattr(context_module, "_LANGFUSE_CURRENT_OBSERVATION_GETTER", None)
+    monkeypatch.setitem(sys.modules, "langfuse", mock_langfuse)
+
+    assert AgentContext._current_langfuse_observation_id() == "obs-tool"
+    assert AgentContext._current_langfuse_observation_id() == "obs-tool"
+    assert get_client_calls == 1
+    assert get_observation_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_context_call_agent_prefers_metadata_langfuse_parent():
+    """Tool integrations can explicitly pass the exact Langfuse parent id."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.execute = AsyncMock(return_value=[])
+    mock_redis.pipeline.return_value = mock_pipe
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.zrangebyscore = AsyncMock(return_value=[b"worker-1"])
+    mock_redis.get = AsyncMock(return_value=b"1")
+
+    ctx = AgentContext(session_id="s1", trace_id="trace-tool", redis_client=mock_redis)
+
+    await ctx.call_agent(
+        target_agent_type="weather-agent",
+        content="weather",
+        metadata={"langfuse_parent_observation_id": "obs-query-weather"},
+    )
+
+    args, _ = mock_redis.xadd.call_args
+    data = json.loads(args[1]["data"])
+    command = command_from_dict(data)
+    assert command.header.langfuse_parent_observation_id == "obs-query-weather"
+    assert command.header.metadata["langfuse_parent_observation_id"] == (
+        "obs-query-weather"
+    )
 
 
 @pytest.mark.asyncio
@@ -219,6 +352,128 @@ async def test_context_dispatch_group_propagates_langfuse_observation_id():
     command = command_from_dict(data)
     assert command.header.langfuse_parent_observation_id == "dummy-obs-id-456"
     assert command.header.metadata["custom"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_context_dispatch_group_prefers_metadata_langfuse_parent():
+    """Each fan-out task can explicitly choose its Langfuse parent."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.execute = AsyncMock(return_value=[])
+    mock_redis.pipeline.return_value = mock_pipe
+
+    ctx = AgentContext(session_id="s1", trace_id="t1", redis_client=mock_redis)
+
+    class DummyObservation:
+        id = "context-parent"
+
+    ctx._langfuse_observation = DummyObservation()
+
+    await ctx.dispatch_group(
+        tasks=[
+            {
+                "target_agent_type": "agent-b",
+                "content": "hello group",
+                "metadata": {"langfuse_parent_observation_id": "explicit-parent"},
+            }
+        ],
+        wait_for_reply=False,
+    )
+
+    args, _ = mock_redis.xadd.call_args
+    data = json.loads(args[1]["data"])
+    command = command_from_dict(data)
+    assert command.header.langfuse_parent_observation_id == "explicit-parent"
+    assert command.header.metadata["langfuse_parent_observation_id"] == (
+        "explicit-parent"
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_dispatch_group_triggers_plugin_lifecycle_hooks():
+    """Parallel fan-out creates per-child call observations through plugins."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.execute = AsyncMock(return_value=[])
+    mock_redis.pipeline.return_value = mock_pipe
+
+    plugin = RecordingCallAgentPlugin()
+    registry = PluginRegistry()
+    registry.register_bundle(plugin)
+
+    ctx = AgentContext(
+        session_id="s1",
+        trace_id="t1",
+        redis_client=mock_redis,
+        current_agent_id="agent-a",
+        message_id="parent-msg",
+        plugin_registry=registry,
+    )
+
+    result = await ctx.dispatch_group(
+        tasks=[
+            {"target_agent_type": "agent-b", "content": "one"},
+            {"target_agent_type": "agent-c", "content": "two"},
+        ],
+    )
+
+    assert result["status"] == "GROUP_QUEUED"
+    assert [event[0] for event in plugin.events] == [
+        "start",
+        "complete",
+        "start",
+        "complete",
+    ]
+    assert {event[1] for event in plugin.events if event[0] == "start"} == {
+        "agent-b",
+        "agent-c",
+    }
+
+
+@pytest.mark.asyncio
+async def test_context_dispatch_group_triggers_error_hook_on_dispatch_failure():
+    """Fan-out dispatch failures end the per-child plugin observation as an error."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock(side_effect=RuntimeError("redis down"))
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.execute = AsyncMock(return_value=[])
+    mock_redis.pipeline.return_value = mock_pipe
+
+    plugin = RecordingCallAgentPlugin()
+    registry = PluginRegistry()
+    registry.register_bundle(plugin)
+
+    ctx = AgentContext(
+        session_id="s1",
+        trace_id="t1",
+        redis_client=mock_redis,
+        current_agent_id="agent-a",
+        message_id="parent-msg",
+        plugin_registry=registry,
+    )
+
+    with pytest.raises(RuntimeError, match="redis down"):
+        await ctx.dispatch_group(
+            tasks=[{"target_agent_type": "agent-b", "content": "one"}],
+        )
+
+    assert [event[0] for event in plugin.events] == ["start", "error"]
+    assert plugin.events[0][1] == "agent-b"
+    assert "redis down" in plugin.events[1][1]
 
 
 @pytest.mark.asyncio

@@ -98,11 +98,24 @@ class WorkerRunner:
 
     @staticmethod
     def _client_dispatch_parent_span_id(header: Any) -> str:
-        """Return the propagated client.dispatch parent span id for a command."""
+        """Return the propagated OTel/Phoenix parent span id for a command."""
         parent_span_id = str(getattr(header, "trace_parent_span_id", "") or "")
         if not parent_span_id:
             metadata = getattr(header, "metadata", {}) or {}
             parent_span_id = str(metadata.get("trace_parent_span_id", "") or "")
+        return parent_span_id or f"{header.message_id}:client.dispatch"
+
+    @staticmethod
+    def _framework_parent_span_id(header: Any) -> str:
+        """Return the framework span id used to build the Redis trace tree."""
+        metadata = getattr(header, "metadata", {}) or {}
+        parent_span_id = str(metadata.get("framework_parent_span_id", "") or "")
+        if parent_span_id:
+            return parent_span_id
+        parent_span_id = str(getattr(header, "trace_parent_span_id", "") or "")
+        if parent_span_id:
+            return parent_span_id
+        parent_span_id = str(metadata.get("trace_parent_span_id", "") or "")
         return parent_span_id or f"{header.message_id}:client.dispatch"
 
     async def setup_streams(self):
@@ -307,6 +320,8 @@ class WorkerRunner:
         err_header: Any = None
         err_start_ts = 0
         err_session_id = ""
+        chunk_count = 0
+        token_usage: dict = {}
 
         try:
             logger.info("[%s] Processing message: %s", self.worker.worker_id, msg_id)
@@ -420,6 +435,7 @@ class WorkerRunner:
             client_dispatch_parent_span_id = self._client_dispatch_parent_span_id(
                 header
             )
+            framework_parent_span_id = self._framework_parent_span_id(header)
             async with live_execution_otel_span(
                 trace_id=header.trace_id,
                 span_id=f"{execution_id}:worker.execute",
@@ -451,11 +467,12 @@ class WorkerRunner:
                     final_status,
                     error_message=str(completion_fields.get("error_message", "")),
                 )
-                # Extract chunk count from the AgentContext if available.
+                # Extract chunk count and token usage from
+                # the AgentContext if available.
                 running_exec = self._tracker.get_execution(execution_id)
-                chunk_count = int(
-                    getattr(getattr(running_exec, "context", None), "_chunk_count", 0)
-                )
+                exec_context = getattr(running_exec, "context", None)
+                chunk_count = int(getattr(exec_context, "_chunk_count", 0))
+                token_usage = dict(getattr(exec_context, "_token_usage", {}) or {})
 
             # Mark finished
             if registry and hasattr(registry, "mark_execution_finished"):
@@ -504,7 +521,8 @@ class WorkerRunner:
                 start_ts=execution_started_at,
                 end_ts=execution_finished_at,
                 chunk_count=chunk_count,
-                parent_span_id=client_dispatch_parent_span_id,
+                parent_span_id=framework_parent_span_id,
+                tokens=token_usage,
             )
 
             await self.redis.xack(stream_name, self.group_name, msg_id)
@@ -535,7 +553,7 @@ class WorkerRunner:
                         route_status="",
                         start_ts=err_start_ts,
                         end_ts=int(time.time() * 1000),
-                        parent_span_id=self._client_dispatch_parent_span_id(err_header),
+                        parent_span_id=self._framework_parent_span_id(err_header),
                     )
                 except Exception:  # pylint: disable=broad-exception-caught
                     pass
@@ -596,6 +614,7 @@ class WorkerRunner:
         end_ts: int,
         parent_span_id: str = "",
         chunk_count: int = 0,
+        tokens: Optional[dict] = None,
     ) -> None:
         try:
             await self.span_recorder.record_span(
@@ -622,6 +641,7 @@ class WorkerRunner:
                     route_policy=route_policy,
                     route_status=route_status,
                     chunk_count=chunk_count,
+                    tokens=tokens or {},
                 )
             )
         except Exception as err:  # pylint: disable=broad-exception-caught

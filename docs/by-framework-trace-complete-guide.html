@@ -437,6 +437,7 @@
         <a href="#read">读取 SDK</a>
         <a href="#langfuse">Langfuse / Phoenix</a>
         <a href="#usage">接入方式</a>
+        <a href="#trace-chain">端到端链路示例</a>
         <a href="#dashboard">Dashboard</a>
         <a href="#diagnostics">排查手册</a>
         <a href="#faq">FAQ</a>
@@ -896,6 +897,245 @@ obs.end()</code></pre>
           <div class="check"><div>Langfuse 使用 <code>langfuse_parent_observation_id</code> 作为父 observation。</div></div>
           <div class="check"><div>长流程使用 workflow span，单次执行使用 worker.execute span。</div></div>
           <div class="check"><div>写入失败必须 best-effort，不影响业务主流程。</div></div>
+        </div>
+      </section>
+
+      <section id="trace-chain">
+        <h2>端到端 Trace 链路示例</h2>
+        <p>
+          本节以 <strong>Client → Orchestrator Worker → Sub-agent (LangGraph) → Return</strong> 为例，
+          展示一次完整请求中 trace_id、Langfuse observation 层级、token 统计如何自动串联。
+        </p>
+
+        <!-- ─── 层级总览 ─── -->
+        <h3>Langfuse 层级总览</h3>
+        <p>
+          一次请求在 Langfuse 中会形成如下树形结构（<code>trace_id</code> 贯穿全程）：
+        </p>
+<pre><code>Trace  {trace_id}
+│
+└─ agent.workflow:orchestrator            ← 整个逻辑任务生命周期（含 suspend/resume）
+   │
+   ├─ worker.execute  [orchestrator, 初始]   token usage: 0（纯路由）
+   │   └─ agent.call_agent:weather-agent   ← on_call_agent_start 打点，记录调用 input/output
+   │       │
+   │       └─ agent.workflow:weather-agent  ← sub-agent 收到命令时以此 obs 为 parent
+   │           └─ worker.execute  [weather-agent]
+   │               └─ generation (ChatOpenAI)  ← input_tokens / output_tokens ✓
+   │
+   ├─ agent.return                          ← sub-agent 回包时打点
+   │
+   └─ worker.execute  [orchestrator, resume]   ← 恢复段，可再次调 LLM</code></pre>
+
+        <p>
+          框架自动完成 <code>langfuse_parent_observation_id</code> 和
+          <code>framework_parent_span_id</code> 的传播——业务代码只需调用
+          <code>context.call_agent()</code>，无需手动处理任何 header。
+        </p>
+
+        <!-- ─── 关键字段传播 ─── -->
+        <h3>关键字段传播路径</h3>
+        <div style="overflow-x:auto">
+          <table>
+            <thead>
+              <tr>
+                <th>字段</th><th>谁写入</th><th>如何传播</th><th>谁消费</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>trace_id</code></td>
+                <td>Client（首次生成）</td>
+                <td>所有派生命令继承 header.trace_id</td>
+                <td>每个 worker，贯穿全链</td>
+              </tr>
+              <tr>
+                <td><code>langfuse_parent_observation_id</code></td>
+                <td><code>on_call_agent_start</code>（写 <code>agent.call_agent</code> obs.id）</td>
+                <td>注入转发命令的 header &amp; metadata</td>
+                <td>sub-agent <code>on_task_start</code> 以此为 parent 挂 workflow</td>
+              </tr>
+              <tr>
+                <td><code>framework_parent_span_id</code></td>
+                <td><code>_enqueue_agent_return</code>（写 <code>{execution_id}:agent.return</code>）</td>
+                <td>ResumeCommand metadata</td>
+                <td>resume 时 <code>worker.execute</code> span 的 parent</td>
+              </tr>
+              <tr>
+                <td><code>usage_metadata</code>（token）</td>
+                <td>LLM 最后一个 streaming chunk（需 <code>stream_options={"include_usage":True}</code>）</td>
+                <td><code>on_llm_end</code> 回调 → <code>context.record_token_usage()</code></td>
+                <td><code>worker.execute</code> Redis span 和 Langfuse observation usage 字段</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- ─── 代码标签页 ─── -->
+        <h3>示例代码</h3>
+        <div class="code-tabs" data-tabs>
+          <div class="tab-buttons">
+            <button class="active" data-tab="chain-client">1. Client</button>
+            <button data-tab="chain-orchestrator">2. Orchestrator Worker</button>
+            <button data-tab="chain-subagent">3. Sub-agent (LangGraph)</button>
+            <button data-tab="chain-plugin">4. 注入 Langfuse Plugin</button>
+          </div>
+
+          <div class="tab-panel active" data-panel="chain-client">
+<pre><code># client_demo.py
+import asyncio
+from by_framework.client import GatewayClient
+
+async def main():
+    client = GatewayClient(
+        redis_host="127.0.0.1",
+        redis_port=6379,
+    )
+    # send_message 自动生成 trace_id、message_id 并写入 Redis Stream
+    response = await client.send_message(
+        target_agent_type="orchestrator",
+        session_id="session-demo-001",
+        content="帮我查一下北京今天天气，然后给我一个出行建议",
+        user_code="user-001",
+        user_name="张三",
+    )
+    print("message_id:", response.message_id)
+    print("trace_id  :", response.trace_id)
+
+asyncio.run(main())</code></pre>
+          </div>
+
+          <div class="tab-panel" data-panel="chain-orchestrator">
+<pre><code># orchestrator_worker.py
+import os
+from typing import Any, List
+from by_framework.worker import GatewayWorker, run_worker
+from by_framework.core.protocol.commands import AskAgentCommand, ResumeCommand
+from by_framework.worker.context import AgentContext
+
+class OrchestratorWorker(GatewayWorker):
+
+    def get_agent_types(self) -> List[str]:
+        return ["orchestrator"]
+
+    async def process_command(
+        self, command: AskAgentCommand | ResumeCommand, context: AgentContext
+    ) -> Any:
+
+        if isinstance(command, ResumeCommand):
+            # ── 恢复阶段：sub-agent 已返回 ──
+            # command.reply_data 是子 agent 的结果
+            weather_result = command.reply_data
+            await context.emit_chunk(
+                f"天气信息已获取：{weather_result}\n根据天气，建议携带雨具出行。"
+            )
+            return {"status": "done", "weather": weather_result}
+
+        # ── 初始阶段：收到用户请求 ──
+        # context.call_agent 自动完成：
+        #   1. 在 Langfuse 创建 agent.call_agent:weather-agent span
+        #   2. 将 langfuse_parent_observation_id 注入转发命令的 header
+        #   3. 挂起本 worker，等待 ResumeCommand 返回
+        await context.call_agent(
+            target_agent_type="weather-agent",
+            content={"city": "北京", "query": command.content},
+            wait_for_reply=True,
+        )
+
+if __name__ == "__main__":
+    run_worker(
+        OrchestratorWorker,
+        worker_id="orchestrator-worker-1",
+        redis_host=os.getenv("BYAI_REDIS_HOST", "127.0.0.1"),
+        redis_port=int(os.getenv("BYAI_REDIS_PORT", 6379)),
+        plugins=[_make_langfuse_plugin()],
+    )</code></pre>
+          </div>
+
+          <div class="tab-panel" data-panel="chain-subagent">
+<pre><code># weather_agent_worker.py
+import os
+from typing import List
+from by_framework.worker import run_worker
+from by_framework_langgraph import LangGraphWorker
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+
+class WeatherAgentWorker(LangGraphWorker):
+
+    def get_agent_types(self) -> List[str]:
+        return ["weather-agent"]
+
+    def build_graph(self, context, command):
+        llm = ChatOpenAI(
+            model=os.getenv("LLM_MODEL", "gpt-4o"),
+            base_url=os.getenv("OPENAI_BASE_URL"),
+            api_key=os.getenv("OPENAI_API_KEY"),
+            streaming=True,
+            # ↓ 必须开启，否则 streaming 模式下拿不到 token 用量
+            stream_options={"include_usage": True},
+        )
+        return create_react_agent(
+            llm,
+            tools=[],
+            checkpointer=self.get_checkpointer(),
+            prompt="你是专业的天气助手，根据城市给出天气状况和出行建议，不超过100字。",
+        )
+
+if __name__ == "__main__":
+    run_worker(
+        WeatherAgentWorker,
+        worker_id="weather-agent-worker-1",
+        redis_host=os.getenv("BYAI_REDIS_HOST", "127.0.0.1"),
+        redis_port=int(os.getenv("BYAI_REDIS_PORT", 6379)),
+        plugins=[_make_langfuse_plugin()],
+    )</code></pre>
+          </div>
+
+          <div class="tab-panel" data-panel="chain-plugin">
+<pre><code># 两个 worker 都需要注入同一套 LangfusePlugin 配置
+import os
+from by_framework_trace_langfuse import LangfusePlugin, LangfuseConfig
+
+def _make_langfuse_plugin() -> LangfusePlugin:
+    return LangfusePlugin(
+        config=LangfuseConfig(
+            public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+            secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+            base_url=os.getenv("LANGFUSE_BASE_URL"),
+        )
+    )
+
+# 在 run_worker 调用时传入：
+# run_worker(MyWorker, ..., plugins=[_make_langfuse_plugin()])</code></pre>
+          </div>
+        </div>
+
+        <!-- ─── 注意事项 ─── -->
+        <h3>常见问题</h3>
+        <div class="checklist">
+          <div class="check">
+            <div>
+              <strong>Token 统计为 0？</strong> OpenAI-compatible streaming API 默认不返回 usage。
+              必须在 ChatModel 上加 <code>stream_options={"include_usage": True}</code>。
+              控制台会出现 <code>[TokenAccumulator] on_llm_end fired but extracted 0 tokens</code> 警告提示。
+            </div>
+          </div>
+          <div class="check">
+            <div>
+              <strong>sub-agent 的 trace 没挂到 orchestrator 下？</strong>
+              检查 orchestrator worker 是否注入了 <code>LangfusePlugin</code>。
+              插件的 <code>on_call_agent_start</code> 钩子负责写入 <code>langfuse_parent_observation_id</code>；
+              没有插件则字段不会被设置。
+            </div>
+          </div>
+          <div class="check">
+            <div>
+              <strong>resume 段的 worker.execute 没有挂到 agent.return 下？</strong>
+              确认 <code>GatewayWorker._enqueue_agent_return</code> 传入了
+              <code>context</code> 参数，它用于计算 <code>framework_parent_span_id</code>。
+            </div>
+          </div>
         </div>
       </section>
 

@@ -17,6 +17,7 @@ from by_framework.core.protocol.agent_state import AgentState
 from by_framework.core.protocol.commands import ResumeCommand
 from by_framework.core.protocol.events import StreamChunkEvent
 from by_framework.trace.span_recorder import str_to_uint64, str_to_uint128
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
@@ -29,6 +30,172 @@ if TYPE_CHECKING:
 
 
 LANGFUSE_OBSERVATION_ATTR = "_langfuse_observation"
+
+
+class _TokenAccumulatingCallbackHandler(BaseCallbackHandler):
+    """LangChain callback handler that accumulates LLM token usage into AgentContext.
+
+    Extracts token usage from whichever location the provider populates:
+      - ``llm_output["token_usage"]``  (OpenAI-style via LangChain)
+      - ``llm_output["usage"]``         (Anthropic-style / raw provider mapping)
+      - ``generation.message.usage_metadata``  (LangChain >= 0.2 standard)
+      - ``generation.generation_info``  (some community integrations)
+
+    ``run_id`` deduplication prevents double-counting when both ``on_llm_end``
+    and ``on_chat_model_end`` fire for the same call (LangChain >= 0.2).
+    """
+
+    def __init__(self, context: Any) -> None:
+        super().__init__()
+        self._context = context
+        self._seen_run_ids: set = set()
+
+    # ------------------------------------------------------------------
+    # LangChain callback entry point
+    # ------------------------------------------------------------------
+
+    def on_llm_end(self, response: Any, *, run_id: Any = None, **_kwargs: Any) -> None:
+        # Guard: only mark run as seen when we actually extracted tokens so that
+        # the on_chat_model_end event path in _stream_invoke can still fire as a
+        # fallback when the callback found nothing (e.g. stream_options not set).
+        if run_id is not None and run_id in self._seen_run_ids:
+            return
+        self._handle_llm_result(response, run_id=run_id)
+
+    # ------------------------------------------------------------------
+    # Internal extraction logic
+    # ------------------------------------------------------------------
+
+    def _handle_llm_result(self, response: Any, *, run_id: Any = None) -> None:
+        context = self._context
+        if context is None:
+            return
+
+        prompt, completion = self._extract_tokens(response)
+
+        if not (prompt or completion):
+            # Log at WARNING (always visible) to help diagnose providers whose
+            # token format is not yet handled, or where stream_options is missing.
+            gens = getattr(response, "generations", []) or []
+            first = (gens[0] or [None])[0] if gens else None
+            msg_type = type(getattr(first, "message", None)).__name__
+            logger.warning(
+                "[TokenAccumulator] on_llm_end fired but extracted 0 tokens. "
+                "For OpenAI-compatible streaming APIs add "
+                "stream_options={'include_usage': True} to your ChatModel. "
+                "llm_output=%r  first_gen_message_type=%s",
+                getattr(response, "llm_output", None),
+                msg_type,
+            )
+            # Do NOT mark run_id as seen — let the on_chat_model_end event path
+            # in _stream_invoke attempt extraction from the merged message.
+            return
+
+        if run_id is not None:
+            self._seen_run_ids.add(run_id)
+        try:
+            context.record_token_usage(
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
+    @staticmethod
+    def _extract_tokens(response: Any) -> tuple[int, int]:
+        """Return (prompt_tokens, completion_tokens) from an LLMResult.
+
+        Checks every known location across providers:
+          1. llm_output["token_usage"]        — OpenAI via LangChain
+          2. llm_output["usage"]              — Anthropic / raw provider mapping
+          3. message.usage_metadata           — LangChain >= 0.2 standard
+          4. message.response_metadata        — some community integrations
+          5. generation.generation_info       — older / custom integrations
+        """
+        prompt, completion = 0, 0
+
+        llm_output = getattr(response, "llm_output", None) or {}
+        if isinstance(llm_output, dict):
+            for key in ("token_usage", "usage"):
+                usage = llm_output.get(key) or {}
+                if usage:
+                    prompt = int(
+                        usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+                    )
+                    completion = int(
+                        usage.get("completion_tokens")
+                        or usage.get("output_tokens")
+                        or 0
+                    )
+                    break
+
+        if prompt or completion:
+            return prompt, completion
+
+        # Iterate all generations
+        for gen_list in getattr(response, "generations", []) or []:
+            for gen in (gen_list if isinstance(gen_list, list) else [gen_list]):
+                msg = getattr(gen, "message", None)
+
+                # LangChain >= 0.2: message.usage_metadata
+                meta = getattr(msg, "usage_metadata", None)
+                if meta:
+                    prompt += int(
+                        meta.get("input_tokens") or meta.get("prompt_tokens") or 0
+                    )
+                    completion += int(
+                        meta.get("output_tokens") or meta.get("completion_tokens") or 0
+                    )
+                    continue
+
+                # response_metadata (e.g. MiniMax, Qwen, some Chinese providers)
+                resp_meta = getattr(msg, "response_metadata", None) or {}
+                if isinstance(resp_meta, dict):
+                    for key in ("token_usage", "usage"):
+                        usage = resp_meta.get(key) or {}
+                        if usage:
+                            prompt += int(
+                                usage.get("prompt_tokens")
+                                or usage.get("input_tokens")
+                                or 0
+                            )
+                            completion += int(
+                                usage.get("completion_tokens")
+                                or usage.get("output_tokens")
+                                or 0
+                            )
+                            break
+                    # Flat keys at root of response_metadata
+                    if not (prompt or completion):
+                        prompt += int(
+                            resp_meta.get("prompt_tokens")
+                            or resp_meta.get("input_tokens")
+                            or 0
+                        )
+                        completion += int(
+                            resp_meta.get("completion_tokens")
+                            or resp_meta.get("output_tokens")
+                            or 0
+                        )
+                    if prompt or completion:
+                        continue
+
+                # generation_info fallback
+                info = getattr(gen, "generation_info", None) or {}
+                for key in ("token_usage", "usage"):
+                    sub = info.get(key) or {}
+                    if sub:
+                        prompt += int(
+                            sub.get("prompt_tokens") or sub.get("input_tokens") or 0
+                        )
+                        completion += int(
+                            sub.get("completion_tokens")
+                            or sub.get("output_tokens")
+                            or 0
+                        )
+                        break
+
+        return prompt, completion
 
 
 @dataclass(frozen=True)
@@ -167,6 +334,47 @@ class LangGraphAdapter:
                         await self._context.emit_chunk(
                             chunk.content, content_type="text"
                         )
+                elif kind == "on_chat_model_end":
+                    # Fallback: capture token usage from the event's merged output
+                    # message when the on_llm_end callback found nothing (e.g. the
+                    # provider requires stream_options but it was not set).
+                    # _TokenAccumulatingCallbackHandler marks run_id as seen only
+                    # after a successful extraction, so this path fires only when
+                    # the callback got 0 tokens.
+                    run_id = event.get("run_id")
+                    token_handler = next(
+                        (
+                            cb
+                            for cb in scoped_callbacks
+                            if isinstance(cb, _TokenAccumulatingCallbackHandler)
+                        ),
+                        None,
+                    )
+                    if token_handler is not None and run_id not in (
+                        token_handler._seen_run_ids  # pylint: disable=protected-access
+                    ):
+                        output = event["data"].get("output")
+                        meta = getattr(output, "usage_metadata", None)
+                        if meta:
+                            prompt = int(
+                                meta.get("input_tokens")
+                                or meta.get("prompt_tokens")
+                                or 0
+                            )
+                            completion = int(
+                                meta.get("output_tokens")
+                                or meta.get("completion_tokens")
+                                or 0
+                            )
+                            if prompt or completion:
+                                token_handler._seen_run_ids.add(run_id)  # pylint: disable=protected-access
+                                try:
+                                    self._context.record_token_usage(
+                                        prompt_tokens=prompt,
+                                        completion_tokens=completion,
+                                    )
+                                except Exception:  # pylint: disable=broad-exception-caught
+                                    pass
                 elif kind == "on_tool_start":
                     tool_name = event["name"]
                     tool_input = event["data"].get("input")
@@ -379,6 +587,9 @@ class LangGraphAdapter:
     @contextmanager
     def _langfuse_callback_manager(self, callbacks: list[Any]) -> Iterator[None]:
         """Prepare Langfuse callback and observation for LangChain."""
+        # Always inject token accumulator — works regardless of Langfuse config.
+        callbacks.append(_TokenAccumulatingCallbackHandler(self._context))
+
         # Prefer AgentContext's callback factory so trace and parent ids align.
         # Filter out auto-generated MagicMock attributes when tests use a mock
         # context — real callback objects always come from a non-test module.

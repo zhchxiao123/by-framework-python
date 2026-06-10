@@ -24,7 +24,8 @@ from .plugin import (AgentConfigsSnapshot, Plugin, PluginBuildContext,
 
 if TYPE_CHECKING:
     from by_framework.core.protocol.commands import (AskAgentCommand,
-                                                     CancelTaskCommand)
+                                                     CancelTaskCommand,
+                                                     ResumeCommand)
     from by_framework.worker.context import AgentContext
     from by_framework.worker.worker import GatewayWorker
 
@@ -644,6 +645,60 @@ class PluginRegistry:
                 plugin,
                 "on_call_agent_error",
                 plugin.on_call_agent_error(context, command, error),
+                session_id=session_id,
+                trace_id=trace_id,
+            )
+
+    async def on_agent_return_start(
+        self,
+        context: "AgentContext",
+        command: "AskAgentCommand",
+        callback_command: "ResumeCommand",
+    ) -> None:
+        session_id, trace_id = self._extract_context_ids(context)
+        for plugin in self.get_active_plugins():
+            await self._execute_hook(
+                plugin,
+                "on_agent_return_start",
+                plugin.on_agent_return_start(context, command, callback_command),
+                session_id=session_id,
+                trace_id=trace_id,
+            )
+
+    async def on_agent_return_complete(
+        self,
+        context: "AgentContext",
+        command: "AskAgentCommand",
+        callback_command: "ResumeCommand",
+    ) -> None:
+        session_id, trace_id = self._extract_context_ids(context)
+        for plugin in self.get_active_plugins():
+            await self._execute_hook(
+                plugin,
+                "on_agent_return_complete",
+                plugin.on_agent_return_complete(context, command, callback_command),
+                session_id=session_id,
+                trace_id=trace_id,
+            )
+
+    async def on_agent_return_error(
+        self,
+        context: "AgentContext",
+        command: "AskAgentCommand",
+        callback_command: "ResumeCommand",
+        error: Exception,
+    ) -> None:
+        session_id, trace_id = self._extract_context_ids(context)
+        for plugin in self.get_active_plugins():
+            await self._execute_hook(
+                plugin,
+                "on_agent_return_error",
+                plugin.on_agent_return_error(
+                    context,
+                    command,
+                    callback_command,
+                    error,
+                ),
                 session_id=session_id,
                 trace_id=trace_id,
             )

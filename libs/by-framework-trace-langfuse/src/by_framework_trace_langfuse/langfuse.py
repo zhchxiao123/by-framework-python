@@ -436,11 +436,22 @@ class LangfusePlugin(Plugin):
                 self._active_workflows[workflow_key] = workflow_obs
                 self._evict_active_workflows_if_needed()
 
+        header_metadata = metadata.get("header_metadata", {})
+        framework_parent_span_id = (
+            str(header_metadata.get("framework_parent_span_id", "") or "")
+            if isinstance(header_metadata, dict)
+            else ""
+        )
+        is_agent_return_resume = framework_parent_span_id.endswith(":agent.return")
+        worker_parent_observation_id = workflow_obs.id if workflow_obs else ""
+        if is_resume and is_agent_return_resume and root_parent_id:
+            worker_parent_observation_id = str(root_parent_id)
+
         worker_execute_obs = tracer.start_observation(
             _ObservationStartRequest(
                 span_id=str_to_uint64(f"{observation_anchor}:worker.execute"),
                 trace_id=trace_id_hex,
-                parent_observation_id=workflow_obs.id if workflow_obs else "",
+                parent_observation_id=worker_parent_observation_id,
                 name="worker.execute",
                 observation_input=command_input,
                 metadata=metadata,
@@ -464,6 +475,10 @@ class LangfusePlugin(Plugin):
         setattr(context, LANGFUSE_WORKFLOW_OBSERVATION_ATTR, workflow_obs)
         setattr(context, LANGFUSE_CALL_PARENT_OBSERVATION_ATTR, workflow_obs)
         setattr(context, WORKER_EXECUTE_OBSERVATION_ATTR, worker_execute_obs)
+        if observation is not None and hasattr(
+            context, "set_trace_parent_observation_id"
+        ):
+            context.set_trace_parent_observation_id(observation.id)
         # Child agents resolve this task through parent_message_id and nest under
         # the durable workflow instead of a worker segment that may end on suspend.
         if workflow_obs is not None:
@@ -473,6 +488,7 @@ class LangfusePlugin(Plugin):
 
     async def on_task_complete(self, context: Any, result: Any) -> None:
         serialized_output = self._serialize_value(result)
+        self._update_observation_usage(context)
         self._end_observation(context, output=serialized_output)
         if not self._is_non_terminal_result(result):
             self._end_workflow_observation(context, output=serialized_output)
@@ -512,6 +528,188 @@ class LangfusePlugin(Plugin):
             context,
             output={"cancelled": True, "reason": reason},
         )
+
+    async def on_call_agent_start(self, context: Any, command: Any) -> None:
+        """Create a call observation and pass it as the child task parent."""
+        tracer = self._get_tracer()
+        header = getattr(command, "header", None)
+        if header is None:
+            return
+
+        trace_id = getattr(header, "trace_id", "") or getattr(context, "trace_id", "")
+        message_id = str(getattr(header, "message_id", "") or "")
+        if not trace_id or not message_id:
+            return
+
+        parent_observation_id = getattr(
+            header, "langfuse_parent_observation_id", ""
+        ) or getattr(header, "metadata", {}).get(
+            LANGFUSE_PARENT_OBSERVATION_METADATA_KEY, ""
+        )
+        target_agent_type = str(getattr(header, "target_agent_type", "") or "")
+        metadata = {
+            "message_id": message_id,
+            "parent_message_id": str(getattr(header, "parent_message_id", "") or ""),
+            "session_id": str(getattr(header, "session_id", "") or ""),
+            "trace_id": trace_id,
+            "source_agent_type": str(getattr(header, "source_agent_type", "") or ""),
+            "target_agent_type": target_agent_type,
+            "header_metadata": self._serialize_value(getattr(header, "metadata", {})),
+        }
+        observation = tracer.start_observation(
+            _ObservationStartRequest(
+                span_id=str_to_uint64(f"{message_id}:client.dispatch"),
+                trace_id=f"{str_to_uint128(trace_id):032x}",
+                parent_observation_id=str(parent_observation_id or ""),
+                name=f"agent.call_agent:{target_agent_type}",
+                observation_input=self._serialize_value(
+                    getattr(command, "content", None)
+                ),
+                metadata=metadata,
+            )
+        )
+        if observation is None:
+            return
+
+        setattr(command, "_langfuse_call_observation", observation)
+        header.langfuse_parent_observation_id = observation.id
+        header.metadata[LANGFUSE_PARENT_OBSERVATION_METADATA_KEY] = observation.id
+
+    async def on_call_agent_complete(
+        self,
+        context: Any,
+        command: Any,
+        result: Any,
+    ) -> None:
+        del context
+        observation = getattr(command, "_langfuse_call_observation", None)
+        if observation is None:
+            return
+        output = self._serialize_value(result)
+        try:
+            observation.end(output=output)
+        except TypeError:
+            observation.update(output=output)
+            observation.end()
+
+    async def on_call_agent_error(
+        self,
+        context: Any,
+        command: Any,
+        error: Exception,
+    ) -> None:
+        del context
+        observation = getattr(command, "_langfuse_call_observation", None)
+        if observation is None:
+            return
+        output = {"error": str(error)}
+        try:
+            observation.update(level="ERROR", status_message=str(error), output=output)
+            observation.end()
+        except TypeError:
+            observation.end(output=output)
+
+    async def on_agent_return_start(
+        self,
+        context: Any,
+        command: Any,
+        callback_command: Any,
+    ) -> None:
+        """Create a return observation and pass it as the resume parent."""
+        del context, command
+        tracer = self._get_tracer()
+        header = getattr(callback_command, "header", None)
+        if header is None:
+            return
+
+        trace_id = str(getattr(header, "trace_id", "") or "")
+        framework_parent_span_id = str(
+            getattr(header, "metadata", {}).get("framework_parent_span_id", "") or ""
+        )
+        if not trace_id or not framework_parent_span_id:
+            return
+
+        parent_observation_id = getattr(
+            header, "langfuse_parent_observation_id", ""
+        ) or getattr(header, "metadata", {}).get(
+            LANGFUSE_PARENT_OBSERVATION_METADATA_KEY, ""
+        )
+        source_agent_type = str(getattr(header, "source_agent_type", "") or "")
+        target_agent_type = str(getattr(header, "target_agent_type", "") or "")
+        metadata = {
+            "message_id": str(getattr(header, "message_id", "") or ""),
+            "parent_message_id": str(getattr(header, "parent_message_id", "") or ""),
+            "session_id": str(getattr(header, "session_id", "") or ""),
+            "trace_id": trace_id,
+            "source_agent_type": source_agent_type,
+            "target_agent_type": target_agent_type,
+            "return_from_agent_type": source_agent_type,
+            "return_to_agent_type": target_agent_type,
+            "return_route": f"{source_agent_type}->{target_agent_type}",
+            "header_metadata": self._serialize_value(getattr(header, "metadata", {})),
+        }
+        observation = tracer.start_observation(
+            _ObservationStartRequest(
+                span_id=str_to_uint64(framework_parent_span_id),
+                trace_id=f"{str_to_uint128(trace_id):032x}",
+                parent_observation_id=str(parent_observation_id or ""),
+                name="agent.return",
+                observation_input=self._serialize_value(
+                    {
+                        "status": getattr(callback_command, "status", ""),
+                        "content": getattr(callback_command, "content", ""),
+                        "reply_data": getattr(callback_command, "reply_data", {}),
+                    }
+                ),
+                metadata=metadata,
+            )
+        )
+        if observation is None:
+            return
+
+        setattr(callback_command, "_langfuse_return_observation", observation)
+        header.langfuse_parent_observation_id = observation.id
+        header.metadata[LANGFUSE_PARENT_OBSERVATION_METADATA_KEY] = observation.id
+
+    async def on_agent_return_complete(
+        self,
+        context: Any,
+        command: Any,
+        callback_command: Any,
+    ) -> None:
+        del context, command
+        observation = getattr(callback_command, "_langfuse_return_observation", None)
+        if observation is None:
+            return
+        output = self._serialize_value(
+            {
+                "status": getattr(callback_command, "status", ""),
+                "reply_data": getattr(callback_command, "reply_data", {}),
+            }
+        )
+        try:
+            observation.end(output=output)
+        except TypeError:
+            observation.update(output=output)
+            observation.end()
+
+    async def on_agent_return_error(
+        self,
+        context: Any,
+        command: Any,
+        callback_command: Any,
+        error: Exception,
+    ) -> None:
+        del context, command
+        observation = getattr(callback_command, "_langfuse_return_observation", None)
+        if observation is None:
+            return
+        output = {"error": str(error)}
+        try:
+            observation.update(level="ERROR", status_message=str(error), output=output)
+            observation.end()
+        except TypeError:
+            observation.end(output=output)
 
     async def _resolve_parent_observation_id(
         self,
@@ -636,6 +834,23 @@ class LangfusePlugin(Plugin):
             metadata[LANGFUSE_PARENT_OBSERVATION_METADATA_KEY] = str(
                 langfuse_parent_observation_id
             )
+        if isinstance(header_metadata, dict):
+            framework_parent_span_id = str(
+                header_metadata.get("framework_parent_span_id", "") or ""
+            )
+            if (
+                framework_parent_span_id.endswith(":agent.return")
+                and header is not None
+            ):
+                metadata["resume_via"] = "agent.return"
+                metadata["resume_from_agent_type"] = str(
+                    getattr(header, "source_agent_type", "") or ""
+                )
+                metadata["resume_to_agent_type"] = str(
+                    getattr(header, "target_agent_type", "") or identity.agent_id
+                )
+                metadata["resume_parent_message_id"] = identity.parent_message_id
+                metadata["resume_return_span_id"] = framework_parent_span_id
         return metadata
 
     @staticmethod
@@ -674,6 +889,30 @@ class LangfusePlugin(Plugin):
             if observation is not None:
                 observations.append(observation)
         return observations
+
+    def _update_observation_usage(self, context: Any) -> None:
+        """Write accumulated token usage onto the worker.execute observation."""
+        try:
+            get_usage = getattr(context, "get_token_usage", None)
+            token_usage = get_usage() if callable(get_usage) else {}
+        except Exception:  # pylint: disable=broad-exception-caught
+            return
+        if not token_usage:
+            return
+        observation = getattr(context, WORKER_EXECUTE_OBSERVATION_ATTR, None)
+        if observation is None:
+            return
+        try:
+            observation.update(
+                usage={
+                    "input": token_usage.get("prompt_tokens", 0),
+                    "output": token_usage.get("completion_tokens", 0),
+                    "total": token_usage.get("total_tokens", 0),
+                    "unit": "TOKENS",
+                }
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
 
     def _end_observation(self, context: Any, *, output: Any) -> None:
         serialized_output = self._serialize_value(output)

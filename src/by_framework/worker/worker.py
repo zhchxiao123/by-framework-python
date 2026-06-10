@@ -9,6 +9,7 @@ lifecycle management, and plugin integration.
 
 import asyncio
 import json
+import time
 import traceback
 import uuid
 from abc import ABC, abstractmethod
@@ -48,6 +49,7 @@ from by_framework.core.protocol.results import (
 )
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.runtime.filestore.base import FileStorage
+from by_framework.trace.span_recorder import TraceSpan, str_to_uint64
 from by_framework.worker.context import AgentContext, current_agent_context_var
 from by_framework.worker.heartbeat import WorkerHeartbeat
 
@@ -204,8 +206,7 @@ class GatewayWorker(ABC):
                     expected_version,
                 )
                 raise RuntimeError(
-                    "Failed to restore persisted agent config snapshot: "
-                    f"{snapshot_key}"
+                    f"Failed to restore persisted agent config snapshot: {snapshot_key}"
                 ) from err
             if snapshot is None:
                 logger.error(
@@ -285,6 +286,7 @@ class GatewayWorker(ABC):
         content: str | list[dict[str, Any]] = "",
         metadata: Optional[dict[str, JsonValue]] = None,
         extra_payload: Optional[dict[str, JsonValue]] = None,
+        context: Optional[AgentContext] = None,
     ):
         """Enqueue agent return response to source agent."""
         header = command.header
@@ -300,6 +302,23 @@ class GatewayWorker(ABC):
             **dict(header.metadata),
             **dict(metadata or {}),
         }
+        return_parent_span_id = self._agent_return_parent_span_id(header, context)
+        return_parent_span_id_hex = f"{str_to_uint64(return_parent_span_id):016x}"
+        merged_metadata["framework_parent_span_id"] = return_parent_span_id
+        merged_metadata["trace_parent_span_id"] = return_parent_span_id_hex
+        langfuse_parent_observation_id = self._agent_return_langfuse_parent_id(
+            header, context
+        )
+        if langfuse_parent_observation_id:
+            merged_metadata["langfuse_parent_observation_id"] = (
+                langfuse_parent_observation_id
+            )
+        await self._record_agent_return_span(
+            command=command,
+            status=status,
+            parent_span_id=return_parent_span_id,
+            context=context,
+        )
 
         callback_command = ResumeCommand(
             header=MessageHeader(
@@ -316,20 +335,105 @@ class GatewayWorker(ABC):
                 user_code=user_code if user_code else "",
                 user_name=user_name if user_name else "",
                 metadata=merged_metadata,
-                trace_parent_span_id=header.trace_parent_span_id
-                or header.metadata.get("trace_parent_span_id", ""),
-                langfuse_parent_observation_id=header.langfuse_parent_observation_id
-                or header.metadata.get("langfuse_parent_observation_id", ""),
+                trace_parent_span_id=return_parent_span_id_hex,
+                langfuse_parent_observation_id=langfuse_parent_observation_id,
             ),
             status=status,
             content=content,
             reply_data=reply_data,
             extra_payload=dict(extra_payload or {}),
         )
-        await self.redis.xadd(
-            RedisKeys.ctrl_stream(callback_command.header.target_agent_type),
-            callback_command.to_redis_payload(),
+        if context is not None:
+            await self.plugin_registry.on_agent_return_start(
+                context,
+                command,
+                callback_command,
+            )
+        try:
+            await self.redis.xadd(
+                RedisKeys.ctrl_stream(callback_command.header.target_agent_type),
+                callback_command.to_redis_payload(),
+            )
+        except Exception as error:
+            if context is not None:
+                await self.plugin_registry.on_agent_return_error(
+                    context,
+                    command,
+                    callback_command,
+                    error,
+                )
+            raise
+        if context is not None:
+            await self.plugin_registry.on_agent_return_complete(
+                context,
+                command,
+                callback_command,
+            )
+
+    @staticmethod
+    def _agent_return_parent_span_id(
+        header: MessageHeader,
+        context: Optional[AgentContext],
+    ) -> str:
+        execution_id = str(getattr(context, "execution_id", "") or "")
+        if execution_id:
+            return f"{execution_id}:agent.return"
+        return f"{header.message_id}:agent.return"
+
+    @staticmethod
+    def _agent_return_langfuse_parent_id(
+        header: MessageHeader,
+        context: Optional[AgentContext],
+    ) -> str:
+        if context is not None:
+            observation_id = context.get_trace_parent_observation_id()
+            if observation_id:
+                return str(observation_id)
+        return str(
+            header.langfuse_parent_observation_id
+            or header.metadata.get("langfuse_parent_observation_id", "")
+            or ""
         )
+
+    async def _record_agent_return_span(
+        self,
+        *,
+        command: GatewayCommand,
+        status: str,
+        parent_span_id: str,
+        context: Optional[AgentContext],
+    ) -> None:
+        if context is None:
+            return
+        start_ts = int(time.time() * 1000)
+        header = command.header
+        worker_parent_span_id = (
+            f"{context.execution_id}:worker.execute"
+            if context.execution_id
+            else f"{header.message_id}:worker.execute"
+        )
+        try:
+            await context.span_recorder.record_span(
+                TraceSpan(
+                    trace_id=context.trace_id,
+                    span_id=parent_span_id,
+                    parent_span_id=worker_parent_span_id,
+                    operation="agent.return",
+                    component="worker",
+                    start_ts=start_ts,
+                    end_ts=int(time.time() * 1000),
+                    status=status,
+                    session_id=context.session_id,
+                    execution_id=context.execution_id,
+                    message_id=header.message_id,
+                    parent_message_id=header.parent_message_id,
+                    worker_id=self.worker_id,
+                    source_agent_type=header.target_agent_type,
+                    target_agent_type=header.source_agent_type,
+                )
+            )
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            logger.debug("Failed to record agent return span: %s", err)
 
     async def _persist_agent_return_state(self, paths: dict, command: GatewayCommand):
         await asyncio.to_thread(self._persist_agent_return_state_sync, paths, command)
@@ -582,6 +686,7 @@ class GatewayWorker(ABC):
                     reply_data=task_result.reply_data,
                     metadata=task_result.metadata,
                     extra_payload=task_result.extra_payload,
+                    context=context,
                 )
             logger.info(
                 "[%s] Task completed successfully with status: %s",
@@ -662,6 +767,7 @@ class GatewayWorker(ABC):
                         command,
                         status=AgentState.CANCELLED.value,
                         reply_data={"reason": reason},
+                        context=context,
                     )
 
             should_emit_stream_end = not has_source_agent and not getattr(
@@ -686,6 +792,7 @@ class GatewayWorker(ABC):
                     command,
                     status=AgentState.FAILED.value,
                     reply_data={"error": str(e)},
+                    context=context,
                 )
             logger.error(traceback.format_exc())
             # Call plugin hook on task error

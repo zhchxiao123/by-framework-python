@@ -368,7 +368,6 @@ class AgentContext:
 
         # 2. Send raw chunk
         self._chunk_count += 1
-        span_started_at = int(time.time() * 1000)
         emitted_message_id = message_id if message_id else self.message_id
         emitted_parent_message_id = (
             parent_message_id if parent_message_id else self.parent_message_id
@@ -383,55 +382,10 @@ class AgentContext:
             event_type=event_type,
             content_type=content_type,
         )
-        await self._record_agent_emit_span(
-            operation="agent.emit_chunk",
-            message_id=emitted_message_id,
-            parent_message_id=emitted_parent_message_id,
-            event_type=event_type,
-            start_ts=span_started_at,
-            end_ts=int(time.time() * 1000),
-        )
 
         # 3. If it's a stream end marker, trigger persistence to history
         if event_type == EventType.APP_STREAM_RESPONSE.value:
             await self.flush_to_history()
-
-    async def _record_agent_emit_span(
-        self,
-        *,
-        operation: str,
-        message_id: str,
-        parent_message_id: str,
-        event_type: str,
-        start_ts: int,
-        end_ts: int,
-    ) -> None:
-        parent_span_id = (
-            f"{self.execution_id}:worker.execute"
-            if self.execution_id
-            else f"{message_id}:worker.execute"
-        )
-        try:
-            await self.span_recorder.record_span(
-                TraceSpan(
-                    trace_id=self.trace_id,
-                    span_id=f"{message_id}:{operation}",
-                    parent_span_id=parent_span_id,
-                    operation=operation,
-                    component="agent_context",
-                    start_ts=start_ts,
-                    end_ts=end_ts,
-                    status="COMPLETED",
-                    session_id=self.session_id,
-                    execution_id=self.execution_id,
-                    message_id=message_id,
-                    parent_message_id=parent_message_id,
-                    target_agent_type=self.current_agent_id,
-                    event_type=event_type,
-                )
-            )
-        except Exception as err:  # pylint: disable=broad-exception-caught
-            logger.debug("Failed to record agent emit span: %s", err)
 
     async def flush_to_history(self) -> None:
         """Persist the current buffer content as an assistant reply to history"""

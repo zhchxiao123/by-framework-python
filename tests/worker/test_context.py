@@ -12,7 +12,6 @@ from by_framework.core.extensions.plugin import Plugin, PluginManifest
 from by_framework.core.extensions.registry import PluginRegistry
 from by_framework.core.protocol.byai_codec import ByaiContentCodec
 from by_framework.core.protocol.commands import (AskAgentCommand, command_from_dict)
-from by_framework.core.protocol.event_type import EventType
 from by_framework.core.protocol.message import (BaiYingMessage, BaiYingMessageRole)
 from by_framework.trace.span_recorder import str_to_uint64
 
@@ -474,47 +473,6 @@ async def test_context_dispatch_group_triggers_error_hook_on_dispatch_failure():
     assert [event[0] for event in plugin.events] == ["start", "error"]
     assert plugin.events[0][1] == "agent-b"
     assert "redis down" in plugin.events[1][1]
-
-
-@pytest.mark.asyncio
-async def test_context_emit_chunk_records_agent_emit_span():
-    """Successful chunk emission writes an agent span for trace drilldown."""
-    from unittest.mock import MagicMock
-
-    mock_redis = MagicMock()
-    mock_pipe = MagicMock()
-    mock_pipe.xadd = MagicMock()
-    mock_pipe.expire = MagicMock()
-    mock_pipe.execute = AsyncMock(return_value=[])
-    mock_redis.pipeline.return_value = mock_pipe
-    span_recorder = AsyncMock()
-
-    ctx = AgentContext(
-        session_id="sess-1",
-        trace_id="trace-ctx",
-        redis_client=mock_redis,
-        current_agent_id="planner",
-        message_id="msg-agent",
-        parent_message_id="msg-parent",
-        execution_id="exec-agent",
-        span_recorder=span_recorder,
-    )
-
-    await ctx.emit_chunk("hello")
-
-    span_recorder.record_span.assert_awaited_once()
-    span = span_recorder.record_span.await_args.args[0]
-    assert span.trace_id == "trace-ctx"
-    assert span.span_id == "msg-agent:agent.emit_chunk"
-    assert span.parent_span_id == "exec-agent:worker.execute"
-    assert span.operation == "agent.emit_chunk"
-    assert span.component == "agent_context"
-    assert span.session_id == "sess-1"
-    assert span.message_id == "msg-agent"
-    assert span.parent_message_id == "msg-parent"
-    assert span.target_agent_type == "planner"
-    assert span.event_type == EventType.ANSWER_DELTA.value
-    assert span.status == "COMPLETED"
 
 
 @pytest.mark.asyncio

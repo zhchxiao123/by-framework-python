@@ -332,6 +332,54 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         span = span_recorder.record_span.await_args.args[0]
         self.assertEqual(span.parent_span_id, "0123456789abcdef")
 
+    async def test_runner_prefers_framework_parent_for_redis_trace_tree(self):
+        """Redis worker.execute spans attach to the framework call span id."""
+        redis_mock = MockRedisRunner(message_to_return=[])
+        worker = DummyWorker()
+        worker.registry = AsyncMock()
+        worker.registry.get_execution_by_message_id.return_value = {
+            "execution_id": "exec-worker",
+            "message_id": "msg-worker",
+            "session_id": "sess-1",
+            "trace_id": "trace-worker",
+            "parent_message_id": "",
+            "target_agent_type": "dummy_agent",
+            "created_at": 100,
+        }
+        span_recorder = AsyncMock()
+
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            span_recorder=span_recorder,
+        )
+        payload = AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-worker",
+                session_id="sess-1",
+                trace_id="trace-worker",
+                target_agent_type="dummy_agent",
+                trace_parent_span_id="0123456789abcdef",
+                metadata={"framework_parent_span_id": "call-msg:client.dispatch"},
+            ),
+            content="test",
+        ).to_dict()
+
+        with patch("by_framework.worker.runner.live_execution_otel_span") as live_span:
+            execute_span = Mock()
+            live_span.return_value.__aenter__ = AsyncMock(return_value=execute_span)
+            live_span.return_value.__aexit__ = AsyncMock(return_value=None)
+            await runner._process_message_from_dict(
+                RedisKeys.ctrl_stream("dummy_agent"), "1-0", payload
+            )
+
+        self.assertEqual(
+            live_span.call_args.kwargs["parent_span_id"], "0123456789abcdef"
+        )
+        span = span_recorder.record_span.await_args.args[0]
+        self.assertEqual(span.parent_span_id, "call-msg:client.dispatch")
+
     async def test_runner_persists_structured_failure_details(self):
         """Test terminal execution updates include structured failure fields."""
         redis_mock = MockRedisRunner(message_to_return=[])

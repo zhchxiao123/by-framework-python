@@ -1,13 +1,15 @@
 """Tests for trace span recording configuration and safety controls."""
 
 import json
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from by_framework import RedisKeys
-from by_framework.observability import span_recorder as span_module
-from by_framework.observability.span_recorder import (
+from by_framework.trace import span_recorder as span_module
+from by_framework.trace.span_recorder import (
     OTelSpanExporter,
     RedisSpanExporter,
     SpanRecorder,
@@ -150,7 +152,17 @@ def test_observability_config_enables_otel_only_when_requested(monkeypatch):
     monkeypatch.setenv("BY_FRAMEWORK_OTEL_ENABLED", "true")
     monkeypatch.delenv("BY_FRAMEWORK_OBSERVABILITY_ENABLED", raising=False)
 
-    with patch("opentelemetry.trace", object()):
+    mock_trace = MagicMock()
+    mock_trace.get_tracer.return_value = MagicMock()
+    mock_otel_module = types.ModuleType("opentelemetry")
+    mock_otel_module.trace = mock_trace
+    with patch.dict(
+        sys.modules,
+        {
+            "opentelemetry": mock_otel_module,
+            "opentelemetry.trace": mock_trace,
+        },
+    ):
         recorder = SpanRecorder(redis_client=MagicMock())
 
     assert any(

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from by_framework.observability.snapshot import _escape_label
+from by_framework.metrics.read_client import (
+    MetricsDiagnostic,
+    MetricsReadClient,
+    MetricsReadResult,
+    MetricsWindow,
+)
 
 try:
     from prometheus_client import REGISTRY, Counter, Histogram  # type: ignore
@@ -37,6 +42,10 @@ class DummyMetric:
 
     def set(self, value: float) -> None:
         del value
+
+
+def _escape_label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def get_registry() -> Any:
@@ -193,3 +202,17 @@ def build_observability_diagnostics_metrics(diagnostics: dict[str, Any]) -> str:
             f'{{exporter="{_escape_label(str(exporter))}"}} {int(count)}'
         )
     return "\n".join(lines) + "\n"
+
+
+__all__ = [
+    "MetricsDiagnostic",
+    "MetricsReadClient",
+    "MetricsReadResult",
+    "MetricsWindow",
+    "PROMETHEUS_AVAILABLE",
+    "build_observability_diagnostics_metrics",
+    "generate_latest_metrics",
+    "get_registry",
+    "record_availability_metrics",
+    "record_execution_metrics",
+]

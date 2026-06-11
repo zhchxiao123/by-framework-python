@@ -1,4 +1,5 @@
 import sys
+import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -61,6 +62,14 @@ class FakeTracer:
 
     def update_trace_output(self, trace_id: str, output: Any) -> None:
         self.trace_output_updates.append({"trace_id": trace_id, "output": output})
+
+
+class SlowTraceOutputTracer(FakeTracer):
+    """Tracer double whose trace output update would block if called inline."""
+
+    def update_trace_output(self, trace_id: str, output: Any) -> None:
+        time.sleep(0.2)
+        super().update_trace_output(trace_id, output)
 
 
 class EndWithoutKwargsObservation:
@@ -172,6 +181,91 @@ def _build_context(
 
 
 @pytest.mark.asyncio
+async def test_langfuse_plugin_call_agent_observation_parents_child_task():
+    tracer = FakeTracer()
+    store = FakeObservationStore()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=store)
+    context = _build_context()
+    command = AskAgentCommand(
+        header=MessageHeader(
+            message_id="msg-child-call",
+            session_id="session-1",
+            trace_id="12345678901234567890123456789012",
+            source_agent_type="planner",
+            target_agent_type="weather-agent",
+            parent_message_id="msg-1",
+            langfuse_parent_observation_id="obs-tool-call",
+            metadata={"framework_parent_span_id": "msg-child-call:client.dispatch"},
+        ),
+        content="weather?",
+    )
+
+    await plugin.on_call_agent_start(context, command)
+    await plugin.on_call_agent_complete(context, command, {"status": "QUEUED"})
+
+    call = tracer.start_calls[-1]
+    assert call["name"] == "agent.call_agent:weather-agent"
+    assert call["parent_observation_id"] == "obs-tool-call"
+    assert command.header.langfuse_parent_observation_id == "obs-1"
+    assert command.header.metadata["langfuse_parent_observation_id"] == "obs-1"
+    assert ("session-1", "msg-child-call") not in store.mapping
+    assert getattr(command, "_langfuse_call_observation").ended_with == {
+        "output": {"status": "QUEUED"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_langfuse_plugin_agent_return_observation_parents_resume_task():
+    from by_framework.trace.span_recorder import str_to_uint64
+
+    tracer = FakeTracer()
+    store = FakeObservationStore()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=store)
+    context = _build_context(message_id="msg-b", current_agent_id="weather-agent")
+    command = AskAgentCommand(
+        header=MessageHeader(
+            message_id="msg-b",
+            session_id="session-1",
+            trace_id="12345678901234567890123456789012",
+            source_agent_type="planner",
+            target_agent_type="weather-agent",
+            parent_message_id="msg-a",
+        ),
+        content="weather?",
+    )
+    callback_command = ResumeCommand(
+        header=MessageHeader(
+            message_id="msg-a",
+            session_id="session-1",
+            trace_id="12345678901234567890123456789012",
+            source_agent_type="weather-agent",
+            target_agent_type="planner",
+            parent_message_id="msg-b",
+            langfuse_parent_observation_id="obs-weather-task",
+            metadata={"framework_parent_span_id": "exec-b:agent.return"},
+        ),
+        status="COMPLETED",
+        reply_data={"answer": "sunny"},
+    )
+
+    await plugin.on_agent_return_start(context, command, callback_command)
+    await plugin.on_agent_return_complete(context, command, callback_command)
+
+    return_call = tracer.start_calls[-1]
+    assert return_call["name"] == "agent.return"
+    assert return_call["parent_observation_id"] == "obs-weather-task"
+    assert return_call["span_id"] == str_to_uint64("exec-b:agent.return")
+    assert return_call["metadata"]["return_route"] == "weather-agent->planner"
+    assert callback_command.header.langfuse_parent_observation_id == "obs-1"
+    assert callback_command.header.metadata["langfuse_parent_observation_id"] == (
+        "obs-1"
+    )
+    assert getattr(callback_command, "_langfuse_return_observation").ended_with == {
+        "output": {"status": "COMPLETED", "reply_data": {"answer": "sunny"}}
+    }
+
+
+@pytest.mark.asyncio
 async def test_langfuse_plugin_starts_observation_and_persists_mapping():
     tracer = FakeTracer()
     store = FakeObservationStore()
@@ -181,23 +275,27 @@ async def test_langfuse_plugin_starts_observation_and_persists_mapping():
 
     await plugin.on_task_start(context)
 
-    # Two native observations are created: worker.execute, then the agent task.
-    assert len(tracer.start_calls) == 2
-    worker_execute_call = tracer.start_calls[0]
-    agent_call = tracer.start_calls[1]
+    # Three native observations are created: workflow, worker.execute, agent task.
+    assert len(tracer.start_calls) == 3
+    workflow_call = tracer.start_calls[0]
+    worker_execute_call = tracer.start_calls[1]
+    agent_call = tracer.start_calls[2]
 
-    # worker.execute hangs under the parent task (store lookup for sub-agents).
+    # workflow hangs under the parent task; worker.execute is one execution segment.
+    assert workflow_call["name"] == "agent.workflow:planner"
+    assert workflow_call["parent_observation_id"] == "obs-parent"
     assert worker_execute_call["name"] == "worker.execute"
-    assert worker_execute_call["parent_observation_id"] == "obs-parent"
+    assert worker_execute_call["parent_observation_id"] == "obs-1"
     assert worker_execute_call["trace_id"] == "12345678901234567890123456789012"
 
     # The agent task nests under this execution's worker.execute observation.
     assert agent_call["name"] == "planner"
-    assert agent_call["parent_observation_id"] == "obs-1"  # worker.execute obs id
+    assert agent_call["parent_observation_id"] == "obs-2"  # worker.execute obs id
     assert agent_call["input"] == "hello"
     assert agent_call["metadata"]["message_id"] == "msg-child"
-    # The agent task observation id is what children look up as their parent.
-    assert store.mapping[("session-1", "msg-child")] == "obs-2"
+    assert context.get_trace_parent_observation_id() == "obs-3"
+    # The workflow observation id is what children look up as their parent.
+    assert store.mapping[("session-1", "msg-child")] == "obs-1"
 
 
 @pytest.mark.asyncio
@@ -209,7 +307,7 @@ async def test_langfuse_plugin_top_level_nests_under_worker_execute():
     default filter in the worker process); the agent task nests under it, and
     worker.execute itself parents to client.dispatch.
     """
-    from by_framework.observability.span_recorder import str_to_uint64
+    from by_framework.trace.span_recorder import str_to_uint64
 
     tracer = FakeTracer()
     store = FakeObservationStore()
@@ -219,24 +317,30 @@ async def test_langfuse_plugin_top_level_nests_under_worker_execute():
 
     await plugin.on_task_start(context)
 
-    assert len(tracer.start_calls) == 2
-    worker_execute_call = tracer.start_calls[0]
-    agent_call = tracer.start_calls[1]
+    assert len(tracer.start_calls) == 3
+    workflow_call = tracer.start_calls[0]
+    worker_execute_call = tracer.start_calls[1]
+    agent_call = tracer.start_calls[2]
 
+    workflow_span_id = str_to_uint64("msg-1:agent.workflow")
     worker_execute_span_id = str_to_uint64("msg-1:worker.execute")
     agent_task_span_id = str_to_uint64("msg-1:agent.task")
 
-    # worker.execute is its own node. With no propagated client parent it has no
-    # synthetic client root in the worker process.
+    assert workflow_call["name"] == "agent.workflow:planner"
+    assert workflow_call["span_id"] == workflow_span_id
+    assert workflow_call["parent_observation_id"] == ""
+    assert workflow_call["as_root"] is False
+
+    # worker.execute is its own execution segment under the durable workflow.
     assert worker_execute_call["name"] == "worker.execute"
     assert worker_execute_call["span_id"] == worker_execute_span_id
-    assert worker_execute_call["parent_observation_id"] == ""
+    assert worker_execute_call["parent_observation_id"] == "obs-1"
     assert worker_execute_call["as_root"] is False
 
     # Agent task nests under worker.execute, with a distinct span id.
     assert agent_call["span_id"] == agent_task_span_id
     assert agent_call["span_id"] != worker_execute_span_id
-    assert agent_call["parent_observation_id"] == "obs-1"  # worker.execute obs id
+    assert agent_call["parent_observation_id"] == "obs-2"  # worker.execute obs id
     assert agent_call["as_root"] is False
 
 
@@ -254,14 +358,17 @@ async def test_langfuse_plugin_top_level_uses_client_dispatch_parent_from_metada
 
     await plugin.on_task_start(context)
 
-    assert len(tracer.start_calls) == 2
-    worker_execute_call = tracer.start_calls[0]
-    agent_call = tracer.start_calls[1]
+    assert len(tracer.start_calls) == 3
+    workflow_call = tracer.start_calls[0]
+    worker_execute_call = tracer.start_calls[1]
+    agent_call = tracer.start_calls[2]
 
+    assert workflow_call["name"] == "agent.workflow:planner"
+    assert workflow_call["parent_observation_id"] == "obs-client-dispatch"
     assert worker_execute_call["name"] == "worker.execute"
-    assert worker_execute_call["parent_observation_id"] == "obs-client-dispatch"
+    assert worker_execute_call["parent_observation_id"] == "obs-1"
     assert worker_execute_call["as_root"] is False
-    assert agent_call["parent_observation_id"] == "obs-1"
+    assert agent_call["parent_observation_id"] == "obs-2"
 
 
 @pytest.mark.asyncio
@@ -280,14 +387,16 @@ async def test_langfuse_plugin_top_level_parent_from_header_attr():
 
     await plugin.on_task_start(context)
 
-    assert len(tracer.start_calls) == 2
-    worker_execute_call = tracer.start_calls[0]
-    agent_call = tracer.start_calls[1]
+    assert len(tracer.start_calls) == 3
+    workflow_call = tracer.start_calls[0]
+    worker_execute_call = tracer.start_calls[1]
+    agent_call = tracer.start_calls[2]
 
+    assert workflow_call["parent_observation_id"] == "obs-client-dispatch"
     assert worker_execute_call["name"] == "worker.execute"
-    assert worker_execute_call["parent_observation_id"] == "obs-client-dispatch"
+    assert worker_execute_call["parent_observation_id"] == "obs-1"
     assert worker_execute_call["as_root"] is False
-    assert agent_call["parent_observation_id"] == "obs-1"
+    assert agent_call["parent_observation_id"] == "obs-2"
 
 
 @pytest.mark.asyncio
@@ -305,9 +414,11 @@ async def test_child_agent_prefers_root_parent_from_metadata():
 
     await plugin.on_task_start(context)
 
-    assert len(tracer.start_calls) == 2
-    worker_execute_call = tracer.start_calls[0]
-    assert worker_execute_call["parent_observation_id"] == "obs-root-client-dispatch"
+    assert len(tracer.start_calls) == 3
+    workflow_call = tracer.start_calls[0]
+    worker_execute_call = tracer.start_calls[1]
+    assert workflow_call["parent_observation_id"] == "obs-root-client-dispatch"
+    assert worker_execute_call["parent_observation_id"] == "obs-1"
 
 
 @pytest.mark.asyncio
@@ -342,15 +453,17 @@ async def test_resume_ignores_parent_observation_id_metadata():
 
     await plugin.on_task_start(context)
 
-    assert len(tracer.start_calls) == 2
-    worker_execute_call = tracer.start_calls[0]
-    assert worker_execute_call["parent_observation_id"] == ""
+    assert len(tracer.start_calls) == 3
+    workflow_call = tracer.start_calls[0]
+    worker_execute_call = tracer.start_calls[1]
+    assert workflow_call["parent_observation_id"] == ""
+    assert worker_execute_call["parent_observation_id"] == "obs-1"
 
 
 @pytest.mark.asyncio
 async def test_resume_uses_distinct_span_ids_to_avoid_parent_cycles():
     """Resume stages must not reuse the original agent.task observation id."""
-    from by_framework.observability.span_recorder import str_to_uint64
+    from by_framework.trace.span_recorder import str_to_uint64
 
     tracer = FakeTracer()
     store = FakeObservationStore()
@@ -389,9 +502,9 @@ async def test_resume_uses_distinct_span_ids_to_avoid_parent_cycles():
     )
     await plugin.on_task_start(resume_context)
 
-    initial_agent_call = tracer.start_calls[1]
-    resume_worker_call = tracer.start_calls[2]
-    resume_agent_call = tracer.start_calls[3]
+    initial_agent_call = tracer.start_calls[2]
+    resume_worker_call = tracer.start_calls[3]
+    resume_agent_call = tracer.start_calls[4]
 
     assert initial_agent_call["span_id"] == str_to_uint64("exec-1:agent.task")
     assert resume_worker_call["span_id"] == str_to_uint64(
@@ -401,8 +514,171 @@ async def test_resume_uses_distinct_span_ids_to_avoid_parent_cycles():
         "exec-1:resume:msg-child:agent.task"
     )
     assert resume_agent_call["span_id"] != initial_agent_call["span_id"]
-    assert resume_worker_call["parent_observation_id"] == "obs-previous-agent"
-    assert resume_agent_call["parent_observation_id"] == "obs-3"
+    assert resume_worker_call["parent_observation_id"] == "obs-1"
+    assert resume_agent_call["parent_observation_id"] == "obs-4"
+
+
+@pytest.mark.asyncio
+async def test_resume_uses_callback_parent_when_context_parent_is_root():
+    """Resume callbacks should use the callback header parent for trace nesting.
+
+    WorkerRunner restores the original execution's parent_message_id onto
+    AgentContext. For a top-level suspended task that value is empty, while the
+    ResumeCommand header still carries the child message that returned. Langfuse
+    needs the header parent to avoid placing the resume stage beside the initial
+    worker.execute.
+    """
+    tracer = FakeTracer()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=FakeObservationStore())
+
+    resume_command = ResumeCommand(
+        header=MessageHeader(
+            message_id="msg-parent",
+            session_id="session-1",
+            trace_id="trace-1",
+            target_agent_type="planner",
+            parent_message_id="msg-child",
+            langfuse_parent_observation_id="obs-original-agent",
+        ),
+        status="success",
+        reply_data="weather result",
+    )
+    resume_context = AgentContext(
+        session_id="session-1",
+        trace_id="trace-1",
+        redis_client=object(),
+        current_agent_id="planner",
+        message_id="msg-parent",
+        parent_message_id="",
+        current_command=resume_command,
+        execution_id="exec-1",
+    )
+
+    await plugin.on_task_start(resume_context)
+
+    workflow_call = tracer.start_calls[0]
+    resume_worker_call = tracer.start_calls[1]
+    assert workflow_call["parent_observation_id"] == "obs-original-agent"
+    assert resume_worker_call["parent_observation_id"] == "obs-1"
+    assert resume_worker_call["metadata"]["parent_message_id"] == "msg-child"
+
+
+@pytest.mark.asyncio
+async def test_langfuse_workflow_stays_open_while_task_is_queued_then_ends_on_resume():
+    """Logical workflow duration spans async child execution and final resume."""
+    tracer = FakeTracer()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=FakeObservationStore())
+
+    initial_context = _build_context(
+        message_id="msg-parent",
+        parent_message_id="",
+        current_agent_id="planner",
+        langfuse_parent_observation_id="obs-client-dispatch",
+    )
+    initial_context.execution_id = "exec-1"
+    await plugin.on_task_start(initial_context)
+
+    workflow = initial_context._langfuse_workflow_observation  # pylint: disable=protected-access
+    worker_execute = initial_context._langfuse_worker_execute_observation  # pylint: disable=protected-access
+    agent_task = initial_context._langfuse_observation  # pylint: disable=protected-access
+
+    await plugin.on_task_complete(initial_context, {"status": "QUEUED"})
+
+    assert workflow.ended_with is None
+    assert worker_execute.ended_with == {"output": {"status": "QUEUED"}}
+    assert agent_task.ended_with == {"output": {"status": "QUEUED"}}
+
+    resume_command = ResumeCommand(
+        header=MessageHeader(
+            message_id="msg-parent",
+            session_id="session-1",
+            trace_id="trace-1",
+            target_agent_type="planner",
+            parent_message_id="msg-child",
+            langfuse_parent_observation_id=workflow.id,
+        ),
+        status="success",
+        reply_data="weather result",
+    )
+    resume_context = AgentContext(
+        session_id="session-1",
+        trace_id="trace-1",
+        redis_client=object(),
+        current_agent_id="planner",
+        message_id="msg-parent",
+        parent_message_id="",
+        current_command=resume_command,
+        execution_id="exec-1",
+    )
+    await plugin.on_task_start(resume_context)
+
+    assert resume_context._langfuse_workflow_observation is workflow  # pylint: disable=protected-access
+    resume_worker_call = tracer.start_calls[3]
+    assert resume_worker_call["parent_observation_id"] == workflow.id
+
+    await plugin.on_task_complete(resume_context, "final answer")
+
+    assert workflow.ended_with == {"output": "final answer"}
+
+
+@pytest.mark.asyncio
+async def test_langfuse_resume_worker_execute_parents_to_agent_return():
+    """Resume execution segment should follow the B -> A return causality."""
+    tracer = FakeTracer()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=FakeObservationStore())
+
+    initial_context = _build_context(
+        message_id="msg-parent",
+        parent_message_id="",
+        current_agent_id="planner",
+        langfuse_parent_observation_id="obs-client-dispatch",
+    )
+    initial_context.execution_id = "exec-a-1"
+    await plugin.on_task_start(initial_context)
+    workflow = initial_context._langfuse_workflow_observation  # pylint: disable=protected-access
+    await plugin.on_task_complete(initial_context, {"status": "QUEUED"})
+
+    resume_command = ResumeCommand(
+        header=MessageHeader(
+            message_id="msg-parent",
+            session_id="session-1",
+            trace_id="trace-1",
+            source_agent_type="weather-agent",
+            target_agent_type="planner",
+            parent_message_id="msg-weather",
+            langfuse_parent_observation_id="obs-agent-return",
+            metadata={
+                "framework_parent_span_id": "exec-weather:agent.return",
+                "langfuse_parent_observation_id": "obs-agent-return",
+            },
+        ),
+        status="success",
+        reply_data="weather result",
+    )
+    resume_context = AgentContext(
+        session_id="session-1",
+        trace_id="trace-1",
+        redis_client=object(),
+        current_agent_id="planner",
+        message_id="msg-parent",
+        parent_message_id="",
+        current_command=resume_command,
+        execution_id="exec-a-2",
+    )
+    await plugin.on_task_start(resume_context)
+
+    assert resume_context._langfuse_workflow_observation is workflow  # pylint: disable=protected-access
+    resume_worker_call = tracer.start_calls[3]
+    resume_agent_call = tracer.start_calls[4]
+    assert resume_worker_call["name"] == "worker.execute"
+    assert resume_worker_call["parent_observation_id"] == "obs-agent-return"
+    assert resume_worker_call["metadata"]["resume_via"] == "agent.return"
+    assert resume_worker_call["metadata"]["resume_from_agent_type"] == "weather-agent"
+    assert resume_worker_call["metadata"]["resume_to_agent_type"] == "planner"
+    assert resume_worker_call["metadata"]["resume_return_span_id"] == (
+        "exec-weather:agent.return"
+    )
+    assert resume_agent_call["parent_observation_id"] == "obs-4"
 
 
 @pytest.mark.asyncio
@@ -416,11 +692,14 @@ async def test_langfuse_plugin_child_task_does_not_become_trace_root():
 
     await plugin.on_task_start(context)
 
-    worker_execute_call = tracer.start_calls[0]
-    agent_call = tracer.start_calls[1]
+    workflow_call = tracer.start_calls[0]
+    worker_execute_call = tracer.start_calls[1]
+    agent_call = tracer.start_calls[2]
 
+    assert workflow_call["name"] == "agent.workflow:planner"
+    assert workflow_call["parent_observation_id"] == "obs-parent"
     assert worker_execute_call["name"] == "worker.execute"
-    assert worker_execute_call["parent_observation_id"] == "obs-parent"
+    assert worker_execute_call["parent_observation_id"] == "obs-1"
     assert worker_execute_call["as_root"] is False
     assert agent_call["as_root"] is False
 
@@ -594,6 +873,72 @@ def test_langfuse_plugin_end_falls_back_to_update_then_plain_end():
 
     assert observation.updates[-1] == {"output": {"status": "ok"}}
     assert observation.end_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_langfuse_trace_output_update_does_not_block_task_complete():
+    """Trace-level output writes should not block the async worker event loop."""
+    tracer = SlowTraceOutputTracer()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=FakeObservationStore())
+    context = _build_context()
+
+    await plugin.on_task_start(context)
+    started = time.perf_counter()
+    await plugin.on_task_complete(context, {"answer": "done"})
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.1
+
+
+def test_start_client_dispatch_observation_reuses_langfuse_client(monkeypatch):
+    """Client dispatch tracing should not instantiate a Langfuse SDK per message."""
+    instances: list[Any] = []
+
+    class FakeLangfuseClient:
+
+        def __init__(self, **kwargs: Any):
+            self.kwargs = kwargs
+            instances.append(self)
+
+        def start_observation(self, **kwargs: Any):
+            del kwargs
+            return FakeSdkObservation()
+
+    fake_module = SimpleNamespace(Langfuse=FakeLangfuseClient)
+    monkeypatch.setitem(sys.modules, "langfuse", fake_module)
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "http://localhost:3000")
+
+    for idx in range(2):
+        langfuse_module.start_client_dispatch_observation(
+            trace_id="trace-client",
+            message_id=f"msg-{idx}",
+            target_agent_type="planner",
+            session_id="session-1",
+            content="hello",
+        )
+
+    assert len(instances) == 1
+
+
+@pytest.mark.asyncio
+async def test_langfuse_plugin_limits_active_workflow_cache():
+    """Long-running workers should cap active workflow handles."""
+    tracer = FakeTracer()
+    plugin = LangfusePlugin(
+        tracer=tracer,
+        observation_store=FakeObservationStore(),
+        max_active_workflows=2,
+    )
+
+    for idx in range(3):
+        context = _build_context(message_id=f"msg-{idx}")
+        await plugin.on_task_start(context)
+        await plugin.on_task_complete(context, {"status": "QUEUED"})
+
+    assert len(plugin._active_workflows) == 2  # pylint: disable=protected-access
+    assert ("session-1", "msg-0") not in plugin._active_workflows  # pylint: disable=protected-access
 
 
 def test_langfuse_trace_provider_factory_builds_plugin_from_env(monkeypatch):

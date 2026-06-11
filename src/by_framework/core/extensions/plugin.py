@@ -17,7 +17,8 @@ from .agent_config import AgentConfig
 
 if TYPE_CHECKING:
     from by_framework.core.protocol.commands import (AskAgentCommand,
-                                                     CancelTaskCommand)
+                                                     CancelTaskCommand,
+                                                     ResumeCommand)
     from by_framework.worker.context import AgentContext
     from by_framework.worker.worker import GatewayWorker
 
@@ -280,4 +281,32 @@ class Plugin(ABC):
         error: Exception,
     ) -> None:
         """Hook triggered when calling another Agent fails."""
+        pass
+
+    async def on_agent_return_start(
+        self,
+        context: "AgentContext",
+        command: "AskAgentCommand",
+        callback_command: "ResumeCommand",
+    ) -> None:
+        """Hook triggered before enqueueing a ResumeCommand to the caller."""
+        pass
+
+    async def on_agent_return_complete(
+        self,
+        context: "AgentContext",
+        command: "AskAgentCommand",
+        callback_command: "ResumeCommand",
+    ) -> None:
+        """Hook triggered after successfully enqueueing a ResumeCommand."""
+        pass
+
+    async def on_agent_return_error(
+        self,
+        context: "AgentContext",
+        command: "AskAgentCommand",
+        callback_command: "ResumeCommand",
+        error: Exception,
+    ) -> None:
+        """Hook triggered when enqueueing a ResumeCommand fails."""
         pass

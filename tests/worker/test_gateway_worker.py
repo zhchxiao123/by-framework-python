@@ -5,6 +5,7 @@ import pytest
 
 from by_framework import (
     AgentConfig,
+    AgentContext,
     AgentTaskResult,
     GatewayWorker,
     PluginRegistry,
@@ -103,6 +104,29 @@ def test_worker_persist_metadata(tmp_path):
     assert data.get("metadata") == {"user_data": "123"}
 
 
+def test_worker_agent_return_langfuse_parent_uses_context_trace_parent():
+    header = MessageHeader(
+        message_id="child-msg",
+        session_id="sess-structured",
+        trace_id="trace-structured",
+        target_agent_type="structured_agent",
+        metadata={"langfuse_parent_observation_id": "metadata-parent"},
+        langfuse_parent_observation_id="header-parent",
+    )
+    context = AgentContext(
+        session_id="sess-structured",
+        trace_id="trace-structured",
+        redis_client=object(),
+        current_agent_id="structured_agent",
+    )
+    context.set_trace_parent_observation_id("context-agent-task")
+
+    assert (
+        GatewayWorker._agent_return_langfuse_parent_id(header, context)
+        == "context-agent-task"
+    )
+
+
 @pytest.mark.asyncio
 async def test_worker_agent_task_result_maps_to_resume_callback(tmp_path):
     redis_mock = AsyncMock()
@@ -149,12 +173,16 @@ async def test_worker_agent_task_result_maps_to_resume_callback(tmp_path):
     assert callback.content == "structured content"
     assert callback.reply_data == {"answer": 42}
     assert callback.extra_payload == {"debug_id": "dbg-1"}
-    assert callback.header.metadata == {
-        "caller": "overridden",
-        "request_id": "req-1",
-        "tokens": 123,
-    }
-    assert callback.header.trace_parent_span_id == "parent-span-1"
+    assert callback.header.metadata["caller"] == "overridden"
+    assert callback.header.metadata["request_id"] == "req-1"
+    assert callback.header.metadata["tokens"] == 123
+    assert callback.header.metadata["framework_parent_span_id"] == (
+        "child-msg:agent.return"
+    )
+    assert callback.header.metadata["trace_parent_span_id"] == (
+        callback.header.trace_parent_span_id
+    )
+    assert callback.header.trace_parent_span_id != "parent-span-1"
     assert callback.header.langfuse_parent_observation_id == "parent-observation-1"
 
 

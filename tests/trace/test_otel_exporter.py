@@ -1,9 +1,10 @@
 import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from by_framework.observability.span_recorder import (
+from by_framework.trace.span_recorder import (
     ContextIdGenerator,
     OTelSpanExporter,
     TraceSpan,
@@ -83,8 +84,7 @@ def test_context_id_generator_fallback():
 @pytest.mark.asyncio
 async def test_otel_span_exporter_missing_dep():
     """OTelSpanExporter stays silent when OTel is unavailable."""
-    # Simulate import failure.
-    with patch("opentelemetry.trace", None):
+    with patch.dict(sys.modules, {"opentelemetry": None}):
         exporter = OTelSpanExporter()
         assert exporter._tracer is None
 
@@ -122,8 +122,10 @@ async def test_otel_span_exporter_success():
     mock_trace.TraceFlags = mock_trace_flags
 
     # Mock imports.
+    mock_otel_module = types.ModuleType("opentelemetry")
+    mock_otel_module.trace = mock_trace
     modules = {
-        "opentelemetry": mock_trace,
+        "opentelemetry": mock_otel_module,
         "opentelemetry.trace": mock_trace,
         "opentelemetry.sdk": MagicMock(),
         "opentelemetry.sdk.trace": MagicMock(),

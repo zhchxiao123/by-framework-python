@@ -41,12 +41,16 @@ members = [
     "libs/by-framework-langgraph",
     "libs/by-framework-trace-langfuse",
     "libs/by-framework-trace-phoenix",
+    "libs/by-framework-trace-query",
+    "libs/by-framework-dashboard",
     "libs/by-framework-adk",
 ]
 
 [tool.uv.sources]
 by-framework-trace-langfuse = { workspace = true }
 by-framework-trace-phoenix = { workspace = true }
+by-framework-trace-query = { workspace = true }
+by-framework-dashboard = { workspace = true }
 
 [tool.pytest.ini_options]
 pythonpath = [
@@ -56,6 +60,8 @@ pythonpath = [
     "libs/by-framework-langgraph/src",
     "libs/by-framework-trace-langfuse/src",
     "libs/by-framework-trace-phoenix/src",
+    "libs/by-framework-trace-query/src",
+    "libs/by-framework-dashboard/src",
     "libs/by-framework-adk/src",
 ]
 testpaths = ["tests"]

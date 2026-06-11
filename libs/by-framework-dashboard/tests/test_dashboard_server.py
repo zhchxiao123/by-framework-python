@@ -7,8 +7,9 @@ import threading
 from http.server import ThreadingHTTPServer
 
 import pytest
+from by_framework.metrics.snapshot import build_demo_observability_snapshot
 
-from by_framework.observability.dashboard import (
+from by_framework_dashboard.dashboard import (
     DashboardAsyncRunner,
     DashboardRuntimeState,
     build_dashboard_runtime_metrics,
@@ -18,7 +19,6 @@ from by_framework.observability.dashboard import (
     serialize_json,
     serialize_text,
 )
-from by_framework.observability.snapshot import build_demo_observability_snapshot
 
 
 def test_read_static_asset_loads_dashboard_index():
@@ -69,7 +69,7 @@ def test_dashboard_async_runner_reuses_event_loop(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        "by_framework.observability.dashboard.close_redis", noop_close_redis
+        "by_framework_dashboard.dashboard.close_redis", noop_close_redis
     )
     runner = DashboardAsyncRunner()
 
@@ -289,7 +289,7 @@ def test_live_trace_endpoint_allows_trace_id_without_session_id(monkeypatch):
         }
 
     monkeypatch.setattr(
-        "by_framework.observability.dashboard.build_trace_observability_snapshot",
+        "by_framework_dashboard.dashboard.build_trace_observability_snapshot",
         fake_build_trace,
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
@@ -318,7 +318,7 @@ async def test_trace_fallback_routing(monkeypatch):
     """Fallback Trace retrieval maps external Jaeger JSON format successfully."""
     from unittest.mock import MagicMock
 
-    from by_framework.observability.dashboard import _fetch_trace_from_fallback
+    from by_framework_dashboard.dashboard import _fetch_trace_from_fallback
 
     mock_response = MagicMock()
     mock_response.status_code = 200
@@ -358,7 +358,7 @@ async def test_trace_fallback_routing(monkeypatch):
         async def get(self, url):
             return mock_response
 
-    import by_framework.observability.dashboard as dashboard
+    import by_framework_dashboard.dashboard as dashboard
 
     monkeypatch.setattr(dashboard, "_fallback_http_client_class", FakeAsyncClient)
 
@@ -407,7 +407,7 @@ def test_trace_fallback_api_routing(monkeypatch):
         del redis_client, trace_id, session_id, event_limit
         return {"status": "UNKNOWN", "spans": []}
 
-    import by_framework.observability.dashboard as dashboard
+    import by_framework_dashboard.dashboard as dashboard
 
     monkeypatch.setattr(dashboard, "_fetch_trace_from_fallback", fake_fetch)
     monkeypatch.setattr(dashboard, "build_trace_observability_snapshot", fake_build)

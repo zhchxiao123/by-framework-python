@@ -100,7 +100,8 @@ class ByClawHistoryBackend(BaseHistoryBackend):
                 data = response.data
             else:
                 # 回退到传统的 base_url 模式
-                url = f"{self.base_url.rstrip('/')}/byaiService/open/api/inner/getMessages"
+                base_url = self.base_url.rstrip("/")
+                url = f"{base_url}/byaiService/open/api/inner/getMessages"
                 logger.debug(
                     "Fetching history via URL: %s, session=%s", url, session_id
                 )

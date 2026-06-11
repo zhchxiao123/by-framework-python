@@ -65,9 +65,11 @@ Plugins can implement: `on_worker_startup`, `on_worker_shutdown`, `on_task_start
 
 ### Redis Key Patterns
 
-- `queue:ctrl:{agent_type}` - Control stream for agent commands
-- `queue:data:stream` - Data stream for events/chunks
-- `worker:active:{worker_id}` - Worker heartbeat registration
+- `byai_gateway:ctrl:agent_type:{agent_type}` — Control stream; competitive consume per agent type
+- `byai_gateway:ctrl:worker:{worker_id}` — Direct per-worker routing
+- `byai_gateway:session:{session_id}:data_stream` — Session-scoped output events
+- `byai_gateway:registry:worker:online:{worker_id}` — Heartbeat TTL key
+- `byai_gateway:task_group:{group_id}` — Scatter-gather group tracker
 
 ## Test Structure
 

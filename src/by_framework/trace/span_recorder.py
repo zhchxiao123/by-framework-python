@@ -6,6 +6,7 @@ import contextvars
 import hashlib
 import json
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
@@ -77,7 +78,27 @@ try:
 except ImportError:
 
     class ContextIdGenerator:  # type: ignore
-        pass
+        """Fallback ID generator used when OpenTelemetry is not installed."""
+
+        def generate_trace_id(self) -> int:
+            """Return a context-provided or random 128-bit trace id."""
+            val = current_trace_id_var.get()
+            if val is not None:
+                return val
+            import secrets
+
+            val_rand = secrets.randbits(128)
+            return val_rand if val_rand != 0 else 1
+
+        def generate_span_id(self) -> int:
+            """Return a context-provided or random 64-bit span id."""
+            val = current_span_id_var.get()
+            if val is not None:
+                return val
+            import secrets
+
+            val_rand = secrets.randbits(64)
+            return val_rand if val_rand != 0 else 1
 
 
 def configure_otel_id_generator() -> None:
@@ -125,6 +146,9 @@ _OBSERVABILITY_DIAGNOSTICS: dict[str, Any] = {
     "export_failures_total": 0,
     "export_failures_by_exporter": {},
 }
+_OBSERVABILITY_DIAGNOSTICS_LOCK = threading.Lock()
+_LANGFUSE_PROCESSOR_PROVIDER_IDS: set[int] = set()
+_LANGFUSE_PROCESSOR_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -171,38 +195,44 @@ def build_observability_config() -> ObservabilityConfig:
 
 def get_observability_diagnostics() -> dict[str, Any]:
     """Return trace exporter self-diagnostics."""
-    return {
-        "dropped_spans_total": int(_OBSERVABILITY_DIAGNOSTICS["dropped_spans_total"]),
-        "dropped_spans_by_reason": dict(
-            _OBSERVABILITY_DIAGNOSTICS["dropped_spans_by_reason"]
-        ),
-        "export_failures_total": int(
-            _OBSERVABILITY_DIAGNOSTICS["export_failures_total"]
-        ),
-        "export_failures_by_exporter": dict(
-            _OBSERVABILITY_DIAGNOSTICS["export_failures_by_exporter"]
-        ),
-    }
+    with _OBSERVABILITY_DIAGNOSTICS_LOCK:
+        return {
+            "dropped_spans_total": int(
+                _OBSERVABILITY_DIAGNOSTICS["dropped_spans_total"]
+            ),
+            "dropped_spans_by_reason": dict(
+                _OBSERVABILITY_DIAGNOSTICS["dropped_spans_by_reason"]
+            ),
+            "export_failures_total": int(
+                _OBSERVABILITY_DIAGNOSTICS["export_failures_total"]
+            ),
+            "export_failures_by_exporter": dict(
+                _OBSERVABILITY_DIAGNOSTICS["export_failures_by_exporter"]
+            ),
+        }
 
 
 def reset_observability_diagnostics() -> None:
     """Reset trace exporter self-diagnostics for tests."""
-    _OBSERVABILITY_DIAGNOSTICS["dropped_spans_total"] = 0
-    _OBSERVABILITY_DIAGNOSTICS["dropped_spans_by_reason"] = {}
-    _OBSERVABILITY_DIAGNOSTICS["export_failures_total"] = 0
-    _OBSERVABILITY_DIAGNOSTICS["export_failures_by_exporter"] = {}
+    with _OBSERVABILITY_DIAGNOSTICS_LOCK:
+        _OBSERVABILITY_DIAGNOSTICS["dropped_spans_total"] = 0
+        _OBSERVABILITY_DIAGNOSTICS["dropped_spans_by_reason"] = {}
+        _OBSERVABILITY_DIAGNOSTICS["export_failures_total"] = 0
+        _OBSERVABILITY_DIAGNOSTICS["export_failures_by_exporter"] = {}
 
 
 def _record_drop(reason: str) -> None:
-    _OBSERVABILITY_DIAGNOSTICS["dropped_spans_total"] += 1
-    by_reason = _OBSERVABILITY_DIAGNOSTICS["dropped_spans_by_reason"]
-    by_reason[reason] = int(by_reason.get(reason, 0)) + 1
+    with _OBSERVABILITY_DIAGNOSTICS_LOCK:
+        _OBSERVABILITY_DIAGNOSTICS["dropped_spans_total"] += 1
+        by_reason = _OBSERVABILITY_DIAGNOSTICS["dropped_spans_by_reason"]
+        by_reason[reason] = int(by_reason.get(reason, 0)) + 1
 
 
 def _record_export_failure(exporter_name: str) -> None:
-    _OBSERVABILITY_DIAGNOSTICS["export_failures_total"] += 1
-    by_exporter = _OBSERVABILITY_DIAGNOSTICS["export_failures_by_exporter"]
-    by_exporter[exporter_name] = int(by_exporter.get(exporter_name, 0)) + 1
+    with _OBSERVABILITY_DIAGNOSTICS_LOCK:
+        _OBSERVABILITY_DIAGNOSTICS["export_failures_total"] += 1
+        by_exporter = _OBSERVABILITY_DIAGNOSTICS["export_failures_by_exporter"]
+        by_exporter[exporter_name] = int(by_exporter.get(exporter_name, 0)) + 1
 
 
 def _clean_env(value: str | None) -> str:
@@ -287,6 +317,13 @@ class TraceSpan:
     start_ts: int
     end_ts: int
     status: str
+    name: str = ""
+    kind: str = ""
+    source: str = "redis"
+    input: Any = None
+    output: Any = None
+    tokens: dict[str, Any] = field(default_factory=dict)
+    cost: dict[str, Any] = field(default_factory=dict)
     session_id: str = ""
     execution_id: str = ""
     message_id: str = ""
@@ -312,17 +349,14 @@ class TraceSpan:
         payload["start_ts"] = int(self.start_ts or 0)
         payload["end_ts"] = max(payload["start_ts"], int(self.end_ts or 0))
         payload["duration_ms"] = max(0, payload["end_ts"] - payload["start_ts"])
+        payload["name"] = self.name or self.operation
         if payload.get("error_message"):
             payload["error_message"] = _sanitize_value(
                 "error_message", payload["error_message"]
             )
         if payload.get("metadata"):
             payload["metadata"] = _sanitize_value("metadata", payload["metadata"])
-        return {
-            key: value
-            for key, value in payload.items()
-            if value not in ("", None) and value is not False
-        }
+        return {key: value for key, value in payload.items() if value not in ("", None)}
 
 
 @runtime_checkable
@@ -351,8 +385,17 @@ class RedisSpanExporter:
         payload = span.to_payload()
         trace_id = str(payload["trace_id"])
         start_ts = int(payload.get("start_ts", 0) or 0)
+        end_ts = int(payload.get("end_ts", start_ts) or start_ts)
         meta_key = RedisKeys.trace_meta(trace_id)
         spans_key = RedisKeys.trace_spans(trace_id)
+        existing_start_ts = await self._read_hash_int(meta_key, "start_ts")
+        existing_updated_at = await self._read_hash_int(meta_key, "updated_at")
+        trace_start_ts = (
+            min(value for value in (existing_start_ts, start_ts) if value > 0)
+            if existing_start_ts or start_ts
+            else 0
+        )
+        updated_at = max(existing_updated_at, end_ts)
         pipe = self.redis.pipeline()
         if isawaitable(pipe):
             pipe = await pipe
@@ -363,14 +406,29 @@ class RedisSpanExporter:
         await self._call_pipeline(
             pipe, "hset", meta_key, "status", str(payload.get("status", ""))
         )
-        await self._call_pipeline(pipe, "hset", meta_key, "start_ts", start_ts)
-        await self._call_pipeline(
-            pipe,
-            "hset",
-            meta_key,
-            "updated_at",
-            int(payload.get("end_ts", start_ts) or start_ts),
-        )
+        operation = str(payload.get("operation", ""))
+        if payload.get("name") and operation.startswith("client.dispatch"):
+            await self._call_pipeline(
+                pipe, "hset", meta_key, "name", str(payload.get("name", ""))
+            )
+        if payload.get("target_agent_type") and operation.startswith("client.dispatch"):
+            await self._call_pipeline(
+                pipe,
+                "hset",
+                meta_key,
+                "root_agent_type",
+                str(payload.get("target_agent_type", "")),
+            )
+        if payload.get("message_id") and operation.startswith("client.dispatch"):
+            await self._call_pipeline(
+                pipe,
+                "hset",
+                meta_key,
+                "root_message_id",
+                str(payload.get("message_id", "")),
+            )
+        await self._call_pipeline(pipe, "hset", meta_key, "start_ts", trace_start_ts)
+        await self._call_pipeline(pipe, "hset", meta_key, "updated_at", updated_at)
         await self._call_pipeline(
             pipe, "rpush", spans_key, json.dumps(payload, ensure_ascii=False)
         )
@@ -412,6 +470,20 @@ class RedisSpanExporter:
         result = getattr(pipe, method_name)(*args)
         if isawaitable(result):
             await result
+
+    async def _read_hash_int(self, name: str, field_name: str) -> int:
+        hget = getattr(self.redis, "hget", None)
+        if not callable(hget):
+            return 0
+        try:
+            value = hget(name, field_name)  # pylint: disable=not-callable
+            if isawaitable(value):
+                value = await value
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
 
 
 class OTelSpanExporter:
@@ -667,30 +739,18 @@ def register_langfuse_span_processor() -> None:
         if secret_key and public_key and base_url:
             # 1. Ensure the global TracerProvider exists and patch the ID generator.
             provider = trace.get_tracer_provider()
-            if hasattr(provider, "_delegate") and provider._delegate is not None:
-                provider = provider._delegate
-
             if not isinstance(provider, TracerProvider):
                 provider = TracerProvider()
                 trace.set_tracer_provider(provider)
                 configure_otel_id_generator()
 
-            # 2. Avoid registering duplicate LangfuseSpanProcessor instances.
-            has_processor = False
-            active_processor = getattr(provider, "_active_span_processor", None)
-            if active_processor is not None:
-                processors = []
-                if hasattr(active_processor, "_span_processors"):
-                    processors = active_processor._span_processors
-                else:
-                    processors = [active_processor]
+            # 2. Avoid duplicate registration from this integration without
+            # relying on OpenTelemetry SDK private provider internals.
+            provider_id = id(provider)
+            with _LANGFUSE_PROCESSOR_LOCK:
+                if provider_id in _LANGFUSE_PROCESSOR_PROVIDER_IDS:
+                    return
 
-                for p in processors:
-                    if p.__class__.__name__ == "LangfuseSpanProcessor":
-                        has_processor = True
-                        break
-
-            if not has_processor:
                 # 3. Dynamically import and attach LangfuseSpanProcessor.
                 langfuse_processor_mod = import_module(
                     "langfuse._client.span_processor"
@@ -725,6 +785,7 @@ def register_langfuse_span_processor() -> None:
                     should_export_span=should_export_span,
                 )
                 provider.add_span_processor(processor)
+                _LANGFUSE_PROCESSOR_PROVIDER_IDS.add(provider_id)
                 logger.info(
                     "LangfuseSpanProcessor registered successfully to global OTel "
                     "TracerProvider. Base URL: %s",

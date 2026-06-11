@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>by-framework Trace 修改与使用说明</title>
+  <style>
+    :root {
+      --ivory: #faf9f5;
+      --slate: #141413;
+      --clay: #d97757;
+      --oat: #e3dacc;
+      --olive: #788c5d;
+      --blue: #4f6f8f;
+      --green: #3f7d58;
+      --gray-150: #f0eee6;
+      --gray-300: #d1cfc5;
+      --gray-500: #87867f;
+      --gray-700: #3d3d3a;
+      --white: #fff;
+      --serif: ui-serif, Georgia, "Times New Roman", serif;
+      --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: var(--ivory);
+      color: var(--gray-700);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+      padding: 56px 24px 120px;
+    }
+    .page {
+      max-width: 1180px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr);
+      gap: 48px;
+    }
+    @media (max-width: 920px) {
+      body { padding: 28px 16px 80px; }
+      .page { grid-template-columns: 1fr; }
+      nav { display: none; }
+    }
+
+    nav {
+      position: sticky;
+      top: 32px;
+      align-self: start;
+      font-size: 13px;
+    }
+    nav .label {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--gray-500);
+      margin-bottom: 12px;
+    }
+    nav a {
+      display: block;
+      padding: 5px 0 5px 12px;
+      border-left: 2px solid var(--gray-300);
+      color: var(--gray-700);
+      text-decoration: none;
+    }
+    nav a:hover { color: var(--slate); border-color: var(--slate); }
+    nav a.l2 { padding-left: 24px; font-size: 12.5px; color: var(--gray-500); }
+    nav .files {
+      margin-top: 28px;
+      border-top: 1px solid var(--gray-300);
+      padding-top: 16px;
+    }
+    nav .files code {
+      display: block;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--gray-500);
+      padding: 3px 0;
+      overflow-wrap: anywhere;
+    }
+
+    header { margin-bottom: 12px; }
+    .eyebrow {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--gray-500);
+      margin-bottom: 10px;
+    }
+    h1 {
+      font-family: var(--serif);
+      font-weight: 500;
+      font-size: clamp(30px, 4vw, 44px);
+      line-height: 1.12;
+      color: var(--slate);
+      letter-spacing: -0.01em;
+      margin-bottom: 14px;
+      max-width: 840px;
+    }
+    h2 {
+      font-family: var(--serif);
+      font-weight: 500;
+      font-size: 24px;
+      color: var(--slate);
+      margin: 42px 0 14px;
+      scroll-margin-top: 24px;
+    }
+    h3 {
+      font-family: var(--serif);
+      font-weight: 500;
+      color: var(--slate);
+      font-size: 18px;
+      margin: 22px 0 8px;
+    }
+    p { margin-bottom: 12px; max-width: 760px; }
+    code { font-family: var(--mono); font-size: 13px; }
+    .muted { color: var(--gray-500); }
+
+    .tldr {
+      border: 1.5px solid var(--gray-300);
+      border-left: 3px solid var(--clay);
+      border-radius: 10px;
+      background: var(--white);
+      padding: 16px 18px;
+      margin: 18px 0 8px;
+      max-width: 860px;
+    }
+    .tldr b { color: var(--slate); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 20px 0;
+      max-width: 900px;
+    }
+    @media (max-width: 760px) { .metrics { grid-template-columns: 1fr 1fr; } }
+    .metric {
+      background: var(--white);
+      border: 1px solid var(--gray-300);
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .metric .num {
+      font-family: var(--serif);
+      color: var(--slate);
+      font-size: 26px;
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+    .metric .txt {
+      font-size: 12px;
+      color: var(--gray-500);
+    }
+
+    details {
+      border: 1.5px solid var(--gray-300);
+      border-radius: 10px;
+      background: var(--white);
+      margin: 14px 0;
+      overflow: hidden;
+      max-width: 920px;
+    }
+    summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 14px 16px;
+      font-family: var(--serif);
+      font-size: 16px;
+      color: var(--slate);
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+    summary::-webkit-details-marker { display: none; }
+    summary::before {
+      content: "▸";
+      color: var(--clay);
+      font-family: var(--sans);
+      font-size: 12px;
+      transition: transform 120ms;
+    }
+    details[open] summary::before { transform: rotate(90deg); }
+    summary .where {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--gray-500);
+      margin-left: auto;
+      white-space: nowrap;
+    }
+    details .body { padding: 0 16px 16px; }
+    details .body p, details .body li { font-size: 14px; }
+
+    .flow {
+      background: var(--white);
+      border: 1.5px solid var(--gray-300);
+      border-radius: 12px;
+      padding: 18px;
+      max-width: 920px;
+      margin: 18px 0;
+      overflow-x: auto;
+    }
+    .tree {
+      font-family: var(--mono);
+      white-space: pre;
+      font-size: 13px;
+      line-height: 1.7;
+      color: var(--slate);
+    }
+    .tree .ok { color: var(--green); }
+    .tree .accent { color: var(--clay); }
+    .tree .blue { color: var(--blue); }
+
+    .tabs {
+      border: 1.5px solid var(--gray-300);
+      border-radius: 10px;
+      background: var(--white);
+      margin: 16px 0 8px;
+      overflow: hidden;
+      max-width: 920px;
+    }
+    .tabbar {
+      display: flex;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--gray-300);
+      background: var(--gray-150);
+    }
+    .tabbar button {
+      appearance: none;
+      border: none;
+      background: none;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--gray-500);
+      padding: 10px 16px;
+      cursor: pointer;
+      border-right: 1px solid var(--gray-300);
+    }
+    .tabbar button.on {
+      background: var(--white);
+      color: var(--slate);
+      border-bottom: 2px solid var(--clay);
+      margin-bottom: -1px;
+    }
+    .tabs pre {
+      display: none;
+      margin: 0;
+      padding: 16px 18px;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      line-height: 1.6;
+      color: var(--slate);
+      overflow-x: auto;
+    }
+    .tabs pre.on { display: block; }
+    .hl { color: var(--clay); }
+    .cm { color: var(--gray-500); }
+
+    .callout {
+      display: flex;
+      gap: 12px;
+      border: 1.5px solid var(--oat);
+      background: rgba(227, 218, 204, 0.35);
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin: 18px 0;
+      font-size: 14px;
+      max-width: 920px;
+    }
+    .callout .ico { color: var(--clay); font-weight: 700; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      max-width: 920px;
+      margin: 16px 0;
+    }
+    @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--white);
+      border: 1px solid var(--gray-300);
+      border-radius: 10px;
+      padding: 15px;
+    }
+    .card strong { color: var(--slate); }
+    .card ul { margin: 8px 0 0 18px; }
+    .card li { margin: 4px 0; }
+    dl.faq { margin-top: 8px; max-width: 820px; }
+    dl.faq dt {
+      font-family: var(--serif);
+      font-size: 16px;
+      color: var(--slate);
+      margin-top: 18px;
+    }
+    dl.faq dd { font-size: 14px; margin: 4px 0 0; max-width: 760px; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <nav>
+      <div class="label">On this page</div>
+      <a href="#tldr">TL;DR</a>
+      <a href="#changed">修改内容</a>
+      <a href="#tree">正确树结构</a>
+      <a href="#usage">使用方式</a>
+      <a href="#usage" class="l2">普通 Worker</a>
+      <a href="#usage" class="l2">LangGraph Worker</a>
+      <a href="#usage" class="l2">外部系统</a>
+      <a href="#demo">Trace Demo</a>
+      <a href="#checklist">排查清单</a>
+      <a href="#faq">FAQ</a>
+      <div class="files">
+        <div class="label">Key files</div>
+        <code>worker/context.py</code>
+        <code>worker/worker.py</code>
+        <code>worker/runner.py</code>
+        <code>trace-langfuse/langfuse.py</code>
+        <code>langgraph/tools.py</code>
+      </div>
+    </nav>
+
+    <main>
+      <header id="tldr">
+        <div class="eyebrow">by-framework trace update · 2026-06-10</div>
+        <h1>Trace 层级修复、LangGraph 调用链和外部接入使用说明</h1>
+        <div class="tldr">
+          <b>结论：</b>这次修改把 trace 链路从“同 trace id 下并列展示”升级为“按真实因果关系挂载”。
+          A 调 B 时，B 会挂到 A 的工具调用节点下面；B 返回 A 时，A resume 会挂到
+          <code>agent.return</code> 下面；普通 worker 和外部系统可以通过统一 header / metadata 接入。
+        </div>
+      </header>
+
+      <section class="metrics" aria-label="change summary">
+        <div class="metric">
+          <div class="num">3</div>
+          <div class="txt">核心 parent 通道：OTel、Langfuse、Redis tree</div>
+        </div>
+        <div class="metric">
+          <div class="num">2</div>
+          <div class="txt">关键因果边：call_agent 与 agent.return</div>
+        </div>
+        <div class="metric">
+          <div class="num">1</div>
+          <div class="txt">Trace demo 改为单一 Langfuse observation 树</div>
+        </div>
+        <div class="metric">
+          <div class="num">0</div>
+          <div class="txt">写入失败不影响任务主流程</div>
+        </div>
+      </section>
+
+      <section id="changed">
+        <h2>修改内容</h2>
+        <p>
+          本轮修改主要解决两个问题：跨 agent 调用时树形结构不符合业务因果关系，以及示例代码同时用
+          OTel 和 Langfuse 手写同名 span 导致重复节点。
+        </p>
+
+        <details open>
+          <summary>1. 区分 framework tree parent 和 OTel parent <span class="where">worker/context.py · worker/runner.py</span></summary>
+          <div class="body">
+            <p>
+              <code>trace_parent_span_id</code> 继续用于 OTel / Phoenix 的十六进制 span parent。
+              新增或使用 <code>framework_parent_span_id</code> 表示 Redis / Dashboard 的框架树 parent。
+              这样不会把 OTel span id 当成框架 span id，避免 dashboard 树断开或错位。
+            </p>
+          </div>
+        </details>
+
+        <details open>
+          <summary>2. A 调 B 时，B 挂到 A 的工具调用下面 <span class="where">langgraph/tools.py · context.py</span></summary>
+          <div class="body">
+            <p>
+              LangGraph 的 <code>query_weather</code> 工具节点由 Langfuse LangChain callback 创建。
+              现在 <code>make_remote_agent_tool()</code> 会从 LangChain 注入的 <code>callbacks.parent_run_id</code>
+              找到当前 tool observation，并通过 <code>metadata.langfuse_parent_observation_id</code>
+              显式传给 <code>context.call_agent()</code>。
+            </p>
+          </div>
+        </details>
+
+        <details open>
+          <summary>3. B 返回 A 时，A resume 挂到 agent.return 下面 <span class="where">worker.py · trace-langfuse/langfuse.py</span></summary>
+          <div class="body">
+            <p>
+              Worker 自动返回时会创建 <code>agent.return</code> observation，并把 ResumeCommand 的
+              <code>langfuse_parent_observation_id</code> 改为该 return observation。A resume 的
+              <code>worker.execute</code> 只有在 <code>framework_parent_span_id</code> 以
+              <code>:agent.return</code> 结尾时，才会挂到 return 节点下，避免普通 resume 被误挂。
+            </p>
+          </div>
+        </details>
+
+        <details>
+          <summary>4. Trace demo 改成单一 Langfuse 树 <span class="where">samples trace-demo-worker/main.py</span></summary>
+          <div class="body">
+            <p>
+              示例 worker 删除了手写 OTel span，避免 LangfuseSpanProcessor 再同步出一棵同名
+              <code>external_complex_pipeline</code>。现在示例只在框架 agent observation 下创建一棵手写
+              Langfuse 子树。
+            </p>
+          </div>
+        </details>
+      </section>
+
+      <section id="tree">
+        <h2>正确树结构</h2>
+        <p>
+          对于 <code>client -> A -> call_agent(B) -> B -> return(A resume)</code>，期望在 Langfuse 上看到：
+        </p>
+        <div class="flow">
+          <div class="tree"><span class="ok">client.dispatch:A</span>
+  └─ client.dispatch:A
+      └─ agent.workflow:A
+          └─ worker.execute <span class="blue">(A initial)</span>
+              └─ A
+                  └─ A:langgraph
+                      └─ tools
+                          └─ query_weather
+                              └─ <span class="accent">agent.call_agent:B</span>
+                                  └─ agent.workflow:B
+                                      └─ worker.execute <span class="blue">(B)</span>
+                                          └─ B
+                                              └─ B:langgraph
+                                      └─ <span class="accent">agent.return</span>
+                                          └─ worker.execute <span class="blue">(A resume)</span>
+                                              └─ A
+                                                  └─ A:langgraph</div>
+        </div>
+
+        <div class="callout">
+          <div class="ico">!</div>
+          <div>
+            <b>不要把 agent.workflow 和具体执行段混为一谈。</b>
+            <code>agent.workflow:A</code> 是跨 suspend/resume 的逻辑容器；
+            <code>worker.execute</code> 才是一次实际 worker 执行。A resume 挂到
+            <code>agent.return</code> 下，表达的是“B 返回触发了 A 的下一段执行”。
+          </div>
+        </div>
+      </section>
+
+      <section id="usage">
+        <h2>使用方式</h2>
+        <p>
+          大多数 by-framework 用户不需要直接操作 trace id。正常使用 client、worker、LangGraph 工具即可。
+          只有外部系统或手动 Langfuse SDK 写入时，才需要显式处理 parent。
+        </p>
+
+        <div class="tabs" data-tabs>
+          <div class="tabbar">
+            <button class="on" data-tab="worker">普通 Worker</button>
+            <button data-tab="langgraph">LangGraph Worker</button>
+            <button data-tab="external">外部系统</button>
+            <button data-tab="demo">Trace Demo</button>
+          </div>
+          <pre class="on" data-panel="worker"><code><span class="cm"># 普通 Worker：无需手动创建根 trace/span</span>
+class MyWorker(GatewayWorker):
+    def get_agent_types(self):
+        return ["my-agent"]
+
+    async def process_command(self, command, context):
+        await context.emit_chunk("started")
+
+        <span class="cm"># 框架自动提供：</span>
+        <span class="cm"># client.dispatch -> worker.execute -> my-agent</span>
+        return {"status": "COMPLETED", "answer": "ok"}</code></pre>
+
+          <pre data-panel="langgraph"><code><span class="cm"># LangGraph remote tool：使用 make_remote_agent_tool</span>
+from by_framework_langgraph import make_remote_agent_tool
+
+weather_tool = make_remote_agent_tool(
+    context,
+    tool_name="query_weather",
+    target_agent_type="weather-agent",
+    description="查询天气并返回结果",
+)
+
+<span class="cm"># 工具内部会自动把 agent.call_agent 挂到 query_weather 下。</span>
+<span class="cm"># 不要自己再手写 langfuse_parent_observation_id。</span></code></pre>
+
+          <pre data-panel="external"><code><span class="cm"># 外部系统收到 AskAgentCommand 后，需要保留这些字段</span>
+header.trace_id
+header.trace_parent_span_id
+header.langfuse_parent_observation_id
+header.metadata["framework_parent_span_id"]
+
+<span class="cm"># 如果外部系统直接写 Langfuse SDK：</span>
+external = langfuse.start_observation(
+    name="external_pipeline",
+    trace_context={
+        "trace_id": normalized_trace_id,
+        "parent_span_id": header.langfuse_parent_observation_id,
+    },
+    as_type="span",
+)</code></pre>
+
+          <pre data-panel="demo"><code><span class="cm"># trace-demo-worker 现在只保留一棵 Langfuse observation 树</span>
+framework_obs = getattr(context, "_langfuse_observation", None)
+external = framework_obs.start_observation(
+    name="external_complex_pipeline",
+    as_type="span",
+    input=content,
+)
+
+retrieval = external.start_observation(name="Knowledge_Retrieval", as_type="retriever")
+llm = external.start_observation(name="LLM_Reasoning_Engine", as_type="generation")
+formatter = external.start_observation(name="Result_Formatter", as_type="span")</code></pre>
+        </div>
+
+        <div class="grid">
+          <div class="card">
+            <strong>Client 侧</strong>
+            <ul>
+              <li>默认创建 <code>client.dispatch</code>。</li>
+              <li>向 command header 注入 <code>trace_id</code>、<code>trace_parent_span_id</code>、Langfuse parent。</li>
+              <li>Langfuse 未配置时 best-effort 跳过，不影响发送消息。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <strong>Worker 侧</strong>
+            <ul>
+              <li>自动创建 <code>worker.execute</code> 和 agent task。</li>
+              <li><code>context.call_agent()</code> 会创建 <code>agent.call_agent</code>。</li>
+              <li>任务返回会创建 <code>agent.return</code> 并触发 resume parent 传递。</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="demo">
+        <h2>Trace Demo 说明</h2>
+        <p>
+          <code>by-framework-samples/python/workers/trace-demo-worker/main.py</code>
+          已经调整为单一 Langfuse observation 示例。新的树应当只有一棵
+          <code>external_complex_pipeline</code>。
+        </p>
+        <div class="flow">
+          <div class="tree">worker.execute
+  └─ trace-demo-agent
+      └─ <span class="accent">external_complex_pipeline</span>
+          ├─ Knowledge_Retrieval
+          │   ├─ VectorDB_Search
+          │   └─ Rerank_Candidates
+          ├─ LLM_Reasoning_Engine
+          └─ Result_Formatter</div>
+        </div>
+      </section>
+
+      <section id="checklist">
+        <h2>排查清单</h2>
+        <details open>
+          <summary>agent.call_agent 没挂到 query_weather 下 <span class="where">LangGraph</span></summary>
+          <div class="body">
+            <p>
+              优先检查是否使用 <code>make_remote_agent_tool()</code>。如果自己写 tool，需要从 LangChain
+              callback manager 中拿当前 tool observation id，并传给 <code>context.call_agent(metadata=...)</code>。
+            </p>
+          </div>
+        </details>
+        <details open>
+          <summary>A resume 没挂到 agent.return 下 <span class="where">ResumeCommand</span></summary>
+          <div class="body">
+            <p>
+              检查 ResumeCommand 是否包含 <code>metadata.framework_parent_span_id=...:agent.return</code>
+              以及 <code>langfuse_parent_observation_id</code>。只有这两个条件满足，resume 的
+              <code>worker.execute</code> 才会挂到 return observation 下。
+            </p>
+          </div>
+        </details>
+        <details>
+          <summary>external_complex_pipeline 出现两次 <span class="where">Demo / external integration</span></summary>
+          <div class="body">
+            <p>
+              说明同一段业务同时用了手写 Langfuse observation 和 OTel span。作为展示文档，建议二选一：
+              要么只用 Langfuse SDK，要么只用 OTel，不要同名重复写入。
+            </p>
+          </div>
+        </details>
+      </section>
+
+      <section id="faq">
+        <h2>FAQ</h2>
+        <dl class="faq">
+          <dt>为什么要同时有 <code>trace_parent_span_id</code> 和 <code>framework_parent_span_id</code>？</dt>
+          <dd>
+            因为前者服务 OTel / Phoenix，是 16 位十六进制 span id；后者服务框架自己的 Redis/Dashboard 树，
+            通常是 <code>message_id:operation</code> 这种稳定字符串。混用会导致层级错位。
+          </dd>
+
+          <dt>为什么 <code>agent.return</code> 显示耗时 0.00s？</dt>
+          <dd>
+            它表示“B 将 ResumeCommand 入队给 A”的动作，不代表 B 的业务耗时。B 的耗时在 B 的
+            <code>worker.execute</code> / LangGraph / LLM 节点上。
+          </dd>
+
+          <dt>外部系统必须接 by-framework SDK 吗？</dt>
+          <dd>
+            不必须。外部系统只要遵守 header 字段和 Langfuse parent observation 传递规则，就可以挂到同一 trace。
+            Python Read SDK / Dashboard 后续可以从 Redis、Langfuse、Phoenix 多源读取。
+          </dd>
+        </dl>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    document.querySelectorAll("[data-tabs]").forEach((tabs) => {
+      const buttons = Array.from(tabs.querySelectorAll("[data-tab]"));
+      const panels = Array.from(tabs.querySelectorAll("[data-panel]"));
+      buttons.forEach((button) => {
+        button.addEventListener("click", () => {
+          const key = button.getAttribute("data-tab");
+          buttons.forEach((item) => item.classList.toggle("on", item === button));
+          panels.forEach((panel) => {
+            panel.classList.toggle("on", panel.getAttribute("data-panel") === key);
+          });
+        });
+      });
+    });
+  </script>
+</body>
+</html>

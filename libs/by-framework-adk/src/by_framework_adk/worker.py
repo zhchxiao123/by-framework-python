@@ -38,7 +38,8 @@ class AdkWorker(ByaiWorker):
         super().__init__(*args, **kwargs)
         if InMemorySessionService is None:
             raise ImportError(
-                "google-adk is not installed. Please install google-adk to use AdkWorker."
+                "google-adk is not installed. "
+                "Please install google-adk to use AdkWorker."
             )
         self._session_service = InMemorySessionService()
 
@@ -92,7 +93,8 @@ class AdkWorker(ByaiWorker):
         if not session:
             # Session doesn't exist, create it
             logger.info(
-                "[AdkWorker] Session not found, creating session for user=%s, session=%s",
+                "[AdkWorker] Session not found, creating session for user=%s, "
+                "session=%s",
                 user_id,
                 context.session_id,
             )

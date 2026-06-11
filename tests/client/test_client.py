@@ -16,7 +16,7 @@ from by_framework.core.protocol.commands import (
 from by_framework.core.protocol.data_message import DataMessage
 from by_framework.core.protocol.message import (BaiYingMessage, BaiYingMessageRole)
 from by_framework.errors import WorkerRegistryNotSetError
-from by_framework.observability.span_recorder import str_to_uint64
+from by_framework.trace.span_recorder import str_to_uint64
 
 
 class FakeObservation:

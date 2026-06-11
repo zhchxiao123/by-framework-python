@@ -1,8 +1,15 @@
 """Tests for tools module."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-from by_framework_langgraph.tools import (make_ask_user_tool, make_remote_agent_tool)
+import pytest
+
+from by_framework_langgraph.tools import (
+    _langfuse_observation_id_from_callbacks,
+    make_ask_user_tool,
+    make_remote_agent_tool,
+)
 
 
 def _make_mock_context(session_id: str = "test-session"):
@@ -31,6 +38,49 @@ class TestMakeRemoteAgentTool:
             ctx, "invoke_poet", "poet-agent", "Invoke the poet agent"
         )
         assert "Invoke the poet agent" in tool.description
+
+    def test_resolves_langfuse_observation_id_from_callbacks(self):
+        """The active tool observation can be read from Langfuse callback state."""
+        run_id = object()
+        handler = SimpleNamespace(_runs={run_id: SimpleNamespace(id="obs-tool")})
+        callbacks = SimpleNamespace(parent_run_id=run_id, handlers=[handler])
+
+        assert _langfuse_observation_id_from_callbacks(callbacks) == "obs-tool"
+
+    @pytest.mark.asyncio
+    async def test_passes_tool_observation_id_to_call_agent(self, monkeypatch):
+        """Remote calls are parented to the current LangGraph tool observation."""
+        ctx = _make_mock_context()
+        ctx.redis.exists.return_value = False
+        tool = make_remote_agent_tool(
+            ctx,
+            "query_weather",
+            "weather-agent",
+            "Query weather",
+        )
+        monkeypatch.setattr(
+            "by_framework_langgraph.tools.interrupt",
+            lambda _message: "queued",
+        )
+
+        run_id = object()
+        handler = SimpleNamespace(_runs={run_id: SimpleNamespace(id="obs-tool")})
+        callbacks = SimpleNamespace(parent_run_id=run_id, handlers=[handler])
+        run_manager = SimpleNamespace(get_child=lambda: callbacks)
+
+        result = await tool._arun(
+            "Beijing weather",
+            tool_call_id="tool-call-1",
+            run_manager=run_manager,
+            config={},
+        )
+
+        assert result == "queued"
+        ctx.call_agent.assert_awaited_once_with(
+            target_agent_type="weather-agent",
+            content="Beijing weather",
+            metadata={"langfuse_parent_observation_id": "obs-tool"},
+        )
 
 
 class TestMakeAskUserTool:

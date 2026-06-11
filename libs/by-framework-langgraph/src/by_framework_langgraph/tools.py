@@ -7,13 +7,38 @@ mechanism.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 from langgraph.types import interrupt
 
 if TYPE_CHECKING:
     from by_framework.worker.context import AgentContext
+
+
+def _langfuse_observation_id_from_callbacks(callbacks: Any) -> str:
+    """Return the Langfuse observation id for the active LangChain tool run."""
+    run_id = getattr(callbacks, "run_id", None) or getattr(
+        callbacks,
+        "parent_run_id",
+        None,
+    )
+    if not run_id:
+        return ""
+
+    handlers = [
+        *list(getattr(callbacks, "handlers", []) or []),
+        *list(getattr(callbacks, "inheritable_handlers", []) or []),
+    ]
+    for handler in handlers:
+        runs = getattr(handler, "_runs", None)
+        if not isinstance(runs, dict):
+            continue
+        observation = runs.get(run_id)
+        observation_id = getattr(observation, "id", None)
+        if observation_id:
+            return str(observation_id)
+    return ""
 
 
 def make_remote_agent_tool(
@@ -50,6 +75,7 @@ def make_remote_agent_tool(
     async def remote_agent_tool(
         topic: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
+        callbacks: Any = None,
     ) -> str:
         # Idempotency guard: checkpoint restore replays tool execution,
         # but we must not re-dispatch the command.
@@ -57,9 +83,19 @@ def make_remote_agent_tool(
         is_dispatched = await context.redis.exists(redis_key)
 
         if not is_dispatched:
+            metadata = {}
+            langfuse_parent_observation_id = _langfuse_observation_id_from_callbacks(
+                callbacks
+            )
+            if langfuse_parent_observation_id:
+                metadata["langfuse_parent_observation_id"] = (
+                    langfuse_parent_observation_id
+                )
+
             await context.call_agent(
                 target_agent_type=target_agent_type,
                 content=topic,
+                metadata=metadata,
             )
             await context.redis.set(redis_key, "1", ex=idempotency_ttl)
 

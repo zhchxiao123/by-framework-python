@@ -3,13 +3,16 @@
 import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from by_framework.core.protocol.commands import AskAgentCommand, ResumeCommand
 from by_framework.core.protocol.message_header import MessageHeader
 
-from by_framework_langgraph.adapter import LangGraphAdapter
+from by_framework_langgraph.adapter import (
+    LangGraphAdapter,
+    _TokenAccumulatingCallbackHandler,
+)
 from by_framework_langgraph.worker import LangGraphWorker
 
 
@@ -251,7 +254,12 @@ class TestAdapterRun:
         assert config["metadata"]["langfuse_user_id"] == "user-1"
         assert config["metadata"]["by_framework_message_id"] == "msg-ctx"
         assert config["metadata"]["langgraph_thread_id"] == "test-session"
-        assert config["callbacks"] == callback_instances
+        # Callbacks list includes the Langfuse handler(s) plus the token accumulator.
+        assert all(cb in config["callbacks"] for cb in callback_instances)
+        assert any(
+            type(cb).__name__ == "_TokenAccumulatingCallbackHandler"
+            for cb in config["callbacks"]
+        )
         assert len(observation_calls) == 1
         assert observation_calls[0]["trace_context"] == {
             "trace_id": "trace-ctx",
@@ -261,7 +269,7 @@ class TestAdapterRun:
 
     @pytest.mark.asyncio
     async def test_uses_context_langfuse_callback_property(self):
-        """Verify AgentContext.langfuse_callback property value is used directly as a handler."""
+        """Verify AgentContext.langfuse_callback property is used directly."""
         handler = object()
 
         # pylint: disable=too-few-public-methods,missing-class-docstring,missing-function-docstring
@@ -301,7 +309,11 @@ class TestAdapterRun:
 
         assert result == "hello"
         _, kwargs = graph.ainvoke.call_args
-        assert kwargs["config"]["callbacks"] == [handler]
+        callbacks = kwargs["config"]["callbacks"]
+        assert handler in callbacks
+        assert any(
+            type(cb).__name__ == "_TokenAccumulatingCallbackHandler" for cb in callbacks
+        )
 
     @pytest.mark.asyncio
     async def test_skips_langfuse_tracing_silently_when_not_configured(
@@ -340,7 +352,13 @@ class TestAdapterRun:
         assert result == "hello"
         _, kwargs = graph.ainvoke.call_args
         config = kwargs["config"]
-        assert "callbacks" not in config
+        # Token accumulator is always present; only Langfuse callbacks should be absent.
+        non_token_callbacks = [
+            cb
+            for cb in config.get("callbacks", [])
+            if type(cb).__name__ != "_TokenAccumulatingCallbackHandler"
+        ]
+        assert non_token_callbacks == []
         assert "Langfuse" not in caplog.text
 
     @pytest.mark.asyncio
@@ -381,7 +399,12 @@ class TestAdapterRun:
         assert result == "hello"
         _, kwargs = graph.ainvoke.call_args
         config = kwargs["config"]
-        assert "callbacks" not in config
+        non_token_callbacks = [
+            cb
+            for cb in config.get("callbacks", [])
+            if type(cb).__name__ != "_TokenAccumulatingCallbackHandler"
+        ]
+        assert non_token_callbacks == []
         assert "Langfuse" not in caplog.text
 
 
@@ -450,3 +473,76 @@ class TestLangGraphWorkerHooks:  # pylint: disable=too-few-public-methods
         assert captured["run_name"] == "custom-run"
         assert captured["metadata"] == {"team": "alpha"}
         assert captured["callbacks"] == ["cb-1"]
+
+
+class TestTokenAccumulatingCallbackHandler:
+
+    def _make_llm_result(self, prompt=10, completion=20, style="openai"):
+        """Build a mock LLMResult in either openai or usage_metadata style."""
+        result = MagicMock()
+        if style == "openai":
+            result.llm_output = {
+                "token_usage": {
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                }
+            }
+            result.generations = []
+        else:
+            result.llm_output = {}
+            gen = MagicMock()
+            gen.message.usage_metadata = {
+                "input_tokens": prompt,
+                "output_tokens": completion,
+            }
+            result.generations = [[gen]]
+        return result
+
+    def test_accumulates_openai_style(self):
+        ctx = MagicMock()
+        handler = _TokenAccumulatingCallbackHandler(ctx)
+        handler.on_llm_end(self._make_llm_result(10, 20, "openai"))
+        ctx.record_token_usage.assert_called_once_with(
+            prompt_tokens=10, completion_tokens=20
+        )
+
+    def test_accumulates_usage_metadata_style(self):
+        ctx = MagicMock()
+        handler = _TokenAccumulatingCallbackHandler(ctx)
+        handler.on_llm_end(self._make_llm_result(5, 15, "metadata"))
+        ctx.record_token_usage.assert_called_once_with(
+            prompt_tokens=5, completion_tokens=15
+        )
+
+    def test_no_call_on_zero_tokens(self):
+        ctx = MagicMock()
+        handler = _TokenAccumulatingCallbackHandler(ctx)
+        result = MagicMock()
+        result.llm_output = {}
+        result.generations = []
+        handler.on_llm_end(result)
+        ctx.record_token_usage.assert_not_called()
+
+    def test_none_context_does_not_raise(self):
+        handler = _TokenAccumulatingCallbackHandler(None)
+        handler.on_llm_end(self._make_llm_result())
+
+    def test_callback_injected_in_tracing_scope(self):
+        """_langfuse_callback_manager injects _TokenAccumulatingCallbackHandler."""
+        ctx = MagicMock()
+        ctx.langfuse_callback = None
+        graph = MagicMock()
+        adapter = LangGraphAdapter(graph=graph, context=ctx)
+
+        callbacks = []
+        with patch.object(
+            adapter,
+            "_langfuse_callback_manager",
+            wraps=adapter._langfuse_callback_manager,
+        ):
+            with adapter._langfuse_callback_manager(callbacks):
+                pass
+
+        assert any(
+            isinstance(cb, _TokenAccumulatingCallbackHandler) for cb in callbacks
+        )

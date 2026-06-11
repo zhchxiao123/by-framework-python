@@ -4,7 +4,7 @@ import pytest
 
 from by_framework import RedisKeys, WorkerRegistry
 from by_framework.core.protocol.data_message import DataMessage
-from by_framework.observability.snapshot import (
+from by_framework.metrics.snapshot import (
     AlertPolicy,
     build_demo_observability_history,
     build_demo_observability_snapshot,
@@ -19,7 +19,7 @@ from by_framework.observability.snapshot import (
     build_trace_observability_snapshot,
     build_worker_observability_snapshot,
 )
-from by_framework.observability.span_recorder import SpanRecorder, TraceSpan
+from by_framework.trace.span_recorder import SpanRecorder, TraceSpan
 
 
 class MockPipeline:

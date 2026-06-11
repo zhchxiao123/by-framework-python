@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from importlib import import_module
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 from typing_extensions import deprecated
 
@@ -53,7 +55,12 @@ from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.core.runtime import AgentRuntimeState
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.runtime.filestore.base import FileStorage
-from by_framework.observability.span_recorder import SpanRecorder, TraceSpan
+from by_framework.trace.span_recorder import (
+    SpanRecorder,
+    TraceSpan,
+    str_to_uint64,
+    str_to_uint128,
+)
 
 if TYPE_CHECKING:
     from by_framework.core.extensions import PluginRegistry
@@ -71,6 +78,7 @@ current_agent_context_var: ContextVar[Optional[AgentContext]] = ContextVar(
 
 # Context variable for the current worker id; set by WorkerRunner before processing.
 current_worker_id_var: ContextVar[str] = ContextVar("current_worker_id_var", default="")
+_LANGFUSE_CURRENT_OBSERVATION_GETTER: Callable[[], Any] | None | bool = None
 
 
 class AgentContext:
@@ -149,6 +157,8 @@ class AgentContext:
         self._permission_transferred = False
         # Flag: execution suspended due to calling agents or waiting
         self._is_suspended = False
+        self._trace_parent_observation_id = ""
+        self._token_usage: dict[str, Any] = {}
         self.plugin_registry = plugin_registry
         self.agent_configs_version = agent_configs_version
         self.is_sub_agent = is_sub_agent
@@ -358,7 +368,6 @@ class AgentContext:
 
         # 2. Send raw chunk
         self._chunk_count += 1
-        span_started_at = int(time.time() * 1000)
         emitted_message_id = message_id if message_id else self.message_id
         emitted_parent_message_id = (
             parent_message_id if parent_message_id else self.parent_message_id
@@ -373,55 +382,10 @@ class AgentContext:
             event_type=event_type,
             content_type=content_type,
         )
-        await self._record_agent_emit_span(
-            operation="agent.emit_chunk",
-            message_id=emitted_message_id,
-            parent_message_id=emitted_parent_message_id,
-            event_type=event_type,
-            start_ts=span_started_at,
-            end_ts=int(time.time() * 1000),
-        )
 
         # 3. If it's a stream end marker, trigger persistence to history
         if event_type == EventType.APP_STREAM_RESPONSE.value:
             await self.flush_to_history()
-
-    async def _record_agent_emit_span(
-        self,
-        *,
-        operation: str,
-        message_id: str,
-        parent_message_id: str,
-        event_type: str,
-        start_ts: int,
-        end_ts: int,
-    ) -> None:
-        parent_span_id = (
-            f"{self.execution_id}:worker.execute"
-            if self.execution_id
-            else f"{message_id}:worker.execute"
-        )
-        try:
-            await self.span_recorder.record_span(
-                TraceSpan(
-                    trace_id=self.trace_id,
-                    span_id=f"{message_id}:{operation}",
-                    parent_span_id=parent_span_id,
-                    operation=operation,
-                    component="agent_context",
-                    start_ts=start_ts,
-                    end_ts=end_ts,
-                    status="COMPLETED",
-                    session_id=self.session_id,
-                    execution_id=self.execution_id,
-                    message_id=message_id,
-                    parent_message_id=parent_message_id,
-                    target_agent_type=self.current_agent_id,
-                    event_type=event_type,
-                )
-            )
-        except Exception as err:  # pylint: disable=broad-exception-caught
-            logger.debug("Failed to record agent emit span: %s", err)
 
     async def flush_to_history(self) -> None:
         """Persist the current buffer content as an assistant reply to history"""
@@ -519,6 +483,43 @@ class AgentContext:
                 self.message_id, self.session_id, status
             )
 
+    def set_trace_parent_observation_id(self, observation_id: str) -> None:
+        """Set the stable observation id used by trace plugins for parenting."""
+        self._trace_parent_observation_id = str(observation_id or "")
+
+    def get_trace_parent_observation_id(self) -> str:
+        """Return the stable observation id used by worker return tracing."""
+        return self._trace_parent_observation_id
+
+    def record_token_usage(
+        self,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        model: str = "",
+    ) -> None:
+        """Accumulate token usage from a single LLM call.
+
+        Intended for agent implementations and framework adapters.  Each call
+        adds to the running totals for the current execution so that the final
+        worker.execute span and the Langfuse observation reflect the aggregate.
+        """
+        self._token_usage["prompt_tokens"] = self._token_usage.get(
+            "prompt_tokens", 0
+        ) + max(0, prompt_tokens)
+        self._token_usage["completion_tokens"] = self._token_usage.get(
+            "completion_tokens", 0
+        ) + max(0, completion_tokens)
+        self._token_usage["total_tokens"] = (
+            self._token_usage["prompt_tokens"] + self._token_usage["completion_tokens"]
+        )
+        if model:
+            self._token_usage["model"] = model
+
+    def get_token_usage(self) -> dict[str, Any]:
+        """Return accumulated token usage for this execution."""
+        return dict(self._token_usage)
+
     async def call_agent(
         self,
         target_agent_type: str,
@@ -552,33 +553,16 @@ class AgentContext:
         serialized_content = self._serialize_outbound_content(content)
 
         metadata = dict(metadata or {})
-        trace_parent_span_id = ""
-        phoenix_span = getattr(self, "_phoenix_span", None)
-        if phoenix_span:
-            try:
-                span_context = phoenix_span.get_span_context()
-                if span_context and span_context.span_id:
-                    trace_parent_span_id = f"{span_context.span_id:016x}"
-            except Exception:  # pylint: disable=broad-exception-caught
-                pass
-        if not trace_parent_span_id:
-            trace_parent_span_id = self._current_otel_span_id_hex()
-        if not trace_parent_span_id and self.current_command:
-            trace_parent_span_id = getattr(
-                self.current_command.header, "trace_parent_span_id", ""
-            ) or self.current_command.header.metadata.get("trace_parent_span_id", "")
-
-        langfuse_parent_observation_id = ""
-        current_obs = getattr(self, "_langfuse_observation", None)
-        current_obs_id = getattr(current_obs, "id", None) if current_obs else None
-        if current_obs_id:
-            langfuse_parent_observation_id = str(current_obs_id)
-        elif self.current_command:
-            langfuse_parent_observation_id = getattr(
-                self.current_command.header, "langfuse_parent_observation_id", ""
-            ) or self.current_command.header.metadata.get(
-                "langfuse_parent_observation_id", ""
-            )
+        call_parent_span_id = f"{message_id}:client.dispatch"
+        trace_parent_span_id = self._resolve_call_trace_parent_span_id(
+            call_parent_span_id
+        )
+        metadata.setdefault("trace_parent_span_id", trace_parent_span_id)
+        metadata.setdefault("framework_parent_span_id", call_parent_span_id)
+        langfuse_parent_observation_id = (
+            str(metadata.get("langfuse_parent_observation_id", "") or "")
+            or self._resolve_call_langfuse_parent_id()
+        )
 
         command = AskAgentCommand(
             header=MessageHeader(
@@ -601,6 +585,15 @@ class AgentContext:
             },
         )
         execution_id = f"{EXECUTION_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+
+        original_langfuse_parent_observation_id = (
+            command.header.langfuse_parent_observation_id
+        )
+        original_metadata_langfuse_parent = command.header.metadata.get(
+            "langfuse_parent_observation_id"
+        )
+        if self.plugin_registry:
+            await self.plugin_registry.on_call_agent_start(self, command)
 
         availability = await AvailabilityRouter(self.redis).prepare_delivery(
             DeliveryIntent(
@@ -643,6 +636,19 @@ class AgentContext:
                 availability_error_code=availability.error_code or "",
                 availability_error=availability.error or "",
             )
+            if self.plugin_registry:
+                await self.plugin_registry.on_call_agent_error(
+                    self, command, RuntimeError(availability.error)
+                )
+            command.header.langfuse_parent_observation_id = (
+                original_langfuse_parent_observation_id
+            )
+            if original_metadata_langfuse_parent is None:
+                command.header.metadata.pop("langfuse_parent_observation_id", None)
+            else:
+                command.header.metadata["langfuse_parent_observation_id"] = (
+                    original_metadata_langfuse_parent
+                )
             return {
                 "status": AgentState.FAILED.value,
                 "message_id": "",
@@ -660,9 +666,6 @@ class AgentContext:
         delivery_stream = availability.stream_name or RedisKeys.ctrl_stream(
             target_agent_type
         )
-
-        if self.plugin_registry:
-            await self.plugin_registry.on_call_agent_start(self, command)
 
         from by_framework.core.registry import WorkerRegistry
 
@@ -710,6 +713,15 @@ class AgentContext:
         except Exception as error:
             if self.plugin_registry:
                 await self.plugin_registry.on_call_agent_error(self, command, error)
+            command.header.langfuse_parent_observation_id = (
+                original_langfuse_parent_observation_id
+            )
+            if original_metadata_langfuse_parent is None:
+                command.header.metadata.pop("langfuse_parent_observation_id", None)
+            else:
+                command.header.metadata["langfuse_parent_observation_id"] = (
+                    original_metadata_langfuse_parent
+                )
             raise
 
         result = {
@@ -814,40 +826,21 @@ class AgentContext:
             content = task.get("content", "")
             extra_payload = task.get("extra_payload", {})
             metadata = dict(task.get("metadata", {}) or {})
-            trace_parent_span_id = ""
-            phoenix_span = getattr(self, "_phoenix_span", None)
-            if phoenix_span:
-                try:
-                    span_context = phoenix_span.get_span_context()
-                    if span_context and span_context.span_id:
-                        trace_parent_span_id = f"{span_context.span_id:016x}"
-                except Exception:  # pylint: disable=broad-exception-caught
-                    pass
-            if not trace_parent_span_id:
-                trace_parent_span_id = self._current_otel_span_id_hex()
-            if not trace_parent_span_id and self.current_command:
-                trace_parent_span_id = getattr(
-                    self.current_command.header, "trace_parent_span_id", ""
-                ) or self.current_command.header.metadata.get(
-                    "trace_parent_span_id", ""
-                )
-
-            langfuse_parent_observation_id = ""
-            current_obs = getattr(self, "_langfuse_observation", None)
-            current_obs_id = getattr(current_obs, "id", None) if current_obs else None
-            if current_obs_id:
-                langfuse_parent_observation_id = str(current_obs_id)
-            elif self.current_command:
-                langfuse_parent_observation_id = getattr(
-                    self.current_command.header, "langfuse_parent_observation_id", ""
-                ) or self.current_command.header.metadata.get(
-                    "langfuse_parent_observation_id", ""
-                )
             serialized_content = self._serialize_outbound_content(content)
 
             current_message_id = message_id or self.generate_message_id()
             parent_message_id = (
                 parent_message_id if parent_message_id else self.message_id
+            )
+            call_parent_span_id = f"{current_message_id}:client.dispatch"
+            trace_parent_span_id = self._resolve_call_trace_parent_span_id(
+                call_parent_span_id
+            )
+            metadata.setdefault("trace_parent_span_id", trace_parent_span_id)
+            metadata.setdefault("framework_parent_span_id", call_parent_span_id)
+            langfuse_parent_observation_id = (
+                str(metadata.get("langfuse_parent_observation_id", "") or "")
+                or self._resolve_call_langfuse_parent_id()
             )
             merged_extra_payload = dict(extra_payload)
             if wait_for_reply:
@@ -877,6 +870,9 @@ class AgentContext:
                 },
             )
 
+            if self.plugin_registry:
+                await self.plugin_registry.on_call_agent_start(self, command)
+
             execution_id = f"{EXECUTION_ID_PREFIX}{uuid.uuid4().hex[:8]}"
             from by_framework.core.registry import WorkerRegistry
 
@@ -902,20 +898,37 @@ class AgentContext:
                     pass  # Fallback if registry fails
 
             dispatch_started_at = int(time.time() * 1000)
-            await self.redis.xadd(
-                RedisKeys.ctrl_stream(target_agent_type), command.to_redis_payload()
-            )
-            await self._record_agent_dispatch_span(
-                message_id=current_message_id,
-                parent_message_id=parent_message_id,
-                source_agent_type=self.current_agent_id if wait_for_reply else "",
-                target_agent_type=target_agent_type,
-                target_worker_id="",
-                route_policy=RoutePolicy.SEND_ANYWAY,
-                route_status="GROUP_DISPATCH",
-                start_ts=dispatch_started_at,
-                end_ts=int(time.time() * 1000),
-            )
+            try:
+                await self.redis.xadd(
+                    RedisKeys.ctrl_stream(target_agent_type), command.to_redis_payload()
+                )
+                await self._record_agent_dispatch_span(
+                    message_id=current_message_id,
+                    parent_message_id=parent_message_id,
+                    source_agent_type=self.current_agent_id if wait_for_reply else "",
+                    target_agent_type=target_agent_type,
+                    target_worker_id="",
+                    route_policy=RoutePolicy.SEND_ANYWAY,
+                    route_status="GROUP_DISPATCH",
+                    start_ts=dispatch_started_at,
+                    end_ts=int(time.time() * 1000),
+                )
+            except Exception as error:
+                if self.plugin_registry:
+                    await self.plugin_registry.on_call_agent_error(self, command, error)
+                raise
+
+            if self.plugin_registry:
+                await self.plugin_registry.on_call_agent_complete(
+                    self,
+                    command,
+                    {
+                        "status": AgentState.QUEUED.value,
+                        "message_id": current_message_id,
+                        "parent_message_id": parent_message_id,
+                        "target_agent_type": target_agent_type,
+                    },
+                )
 
             dispatched.append(
                 {
@@ -971,6 +984,79 @@ class AgentContext:
         raise TypeError(
             "AgentContext requires a content codec to serialize non-wire content"
         )
+
+    def _resolve_call_trace_parent_span_id(self, call_parent_span_id: str) -> str:
+        """Return the OTel/Phoenix parent id for an outbound agent call."""
+        phoenix_span = getattr(self, "_phoenix_span", None)
+        if phoenix_span:
+            try:
+                span_context = phoenix_span.get_span_context()
+                if span_context and span_context.span_id:
+                    return f"{span_context.span_id:016x}"
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+
+        current_otel_span_id = self._current_otel_span_id_hex()
+        if current_otel_span_id:
+            return current_otel_span_id
+
+        return f"{str_to_uint64(call_parent_span_id):016x}"
+
+    def _resolve_call_langfuse_parent_id(self) -> str:
+        """Return the Langfuse parent for an outbound agent call."""
+        current_langfuse_observation_id = self._current_langfuse_observation_id()
+        if current_langfuse_observation_id:
+            return current_langfuse_observation_id
+
+        current_otel_span_id = self._current_otel_span_id_hex()
+        if current_otel_span_id:
+            return current_otel_span_id
+
+        current_obs = getattr(
+            self,
+            "_langfuse_call_parent_observation",
+            None,
+        ) or getattr(self, "_langfuse_observation", None)
+        current_obs_id = getattr(current_obs, "id", None) if current_obs else None
+        if current_obs_id:
+            return str(current_obs_id)
+
+        if self.current_command:
+            return getattr(
+                self.current_command.header, "langfuse_parent_observation_id", ""
+            ) or self.current_command.header.metadata.get(
+                "langfuse_parent_observation_id", ""
+            )
+        return ""
+
+    @staticmethod
+    def _current_langfuse_observation_id() -> str:
+        global _LANGFUSE_CURRENT_OBSERVATION_GETTER  # pylint: disable=global-statement
+        try:
+            if not (
+                os.environ.get("LANGFUSE_SECRET_KEY")
+                and os.environ.get("LANGFUSE_PUBLIC_KEY")
+                and os.environ.get("LANGFUSE_BASE_URL")
+            ):
+                return ""
+
+            if _LANGFUSE_CURRENT_OBSERVATION_GETTER is False:
+                return ""
+            if _LANGFUSE_CURRENT_OBSERVATION_GETTER is None:
+                get_client = getattr(import_module("langfuse"), "get_client", None)
+                if get_client is None:
+                    _LANGFUSE_CURRENT_OBSERVATION_GETTER = False
+                    return ""
+                client = get_client()
+                getter = getattr(client, "get_current_observation_id", None)
+                _LANGFUSE_CURRENT_OBSERVATION_GETTER = getter or False
+
+            if _LANGFUSE_CURRENT_OBSERVATION_GETTER is False:
+                return ""
+            observation_id = _LANGFUSE_CURRENT_OBSERVATION_GETTER()
+            return str(observation_id or "")
+        except Exception:  # pylint: disable=broad-exception-caught
+            return ""
 
     @staticmethod
     def _current_otel_span_id_hex() -> str:
@@ -1059,16 +1145,9 @@ class AgentContext:
 
         Returns:
             A langfuse.langchain.CallbackHandler instance, or None when disabled or
-            unavailable.
+        unavailable.
         """
         try:
-            import os
-            from importlib import import_module
-
-            from by_framework.observability.span_recorder import (
-                str_to_uint64,
-                str_to_uint128,
-            )
 
             def clean(val):
                 return val.strip().strip("'\"“”‘’") if val else ""

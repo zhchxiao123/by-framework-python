@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
@@ -18,7 +20,7 @@ from by_framework.core.extensions import (
     TraceProviderFactory,
 )
 from by_framework.core.registry import WorkerRegistry
-from by_framework.observability.span_recorder import (
+from by_framework.trace.span_recorder import (
     configure_otel_id_generator,
     current_span_id_var,
     current_trace_id_var,
@@ -27,10 +29,13 @@ from by_framework.observability.span_recorder import (
 )
 
 LANGFUSE_OBSERVATION_ATTR = "_langfuse_observation"
+LANGFUSE_CALL_PARENT_OBSERVATION_ATTR = "_langfuse_call_parent_observation"
+LANGFUSE_WORKFLOW_OBSERVATION_ATTR = "_langfuse_workflow_observation"
 WORKER_EXECUTE_OBSERVATION_ATTR = "_langfuse_worker_execute_observation"
 LANGFUSE_PARENT_OBSERVATION_METADATA_KEY = "langfuse_parent_observation_id"
 _QUOTES_TO_STRIP = "\"'“”‘’"
 _FALSE_LIKE_VALUES = {"0", "false", "no", "off", "disabled"}
+_CLIENT_DISPATCH_TRACER_CACHE: dict[LangfuseConfig, "_SdkLangfuseTracer"] = {}
 
 
 @dataclass(frozen=True)
@@ -259,8 +264,9 @@ class _SdkLangfuseTracer:
                     }
                 ]
             }
+            base_url = self._config.base_url.rstrip("/")
             response = httpx.post(
-                f"{self._config.base_url.rstrip('/')}/api/public/ingestion",
+                f"{base_url}/api/public/ingestion",
                 json=payload,
                 auth=(self._config.public_key, self._config.secret_key),
                 headers={
@@ -327,10 +333,16 @@ class LangfusePlugin(Plugin):
         observation_store: Optional[ObservationStore] = None,
         plugin_id: str = "langfuse",
         enabled: bool = True,
+        max_active_workflows: int = 10000,
     ):
         super().__init__(PluginManifest(plugin_id=plugin_id, enabled=enabled))
         self._tracer = tracer
         self._observation_store = observation_store
+        self._active_workflows: OrderedDict[tuple[str, str], ObservationHandle] = (
+            OrderedDict()
+        )
+        self._max_active_workflows = max(1, int(max_active_workflows or 10000))
+        self._pending_trace_output_updates: set[asyncio.Future[Any]] = set()
 
     async def register_agent_configs(
         self, build_context: Any
@@ -349,6 +361,11 @@ class LangfusePlugin(Plugin):
 
     async def on_worker_shutdown(self, worker: Any) -> None:
         del worker
+        if self._pending_trace_output_updates:
+            await asyncio.gather(
+                *list(self._pending_trace_output_updates),
+                return_exceptions=True,
+            )
         if self._tracer is not None:
             self._tracer.shutdown()
 
@@ -372,8 +389,9 @@ class LangfusePlugin(Plugin):
         )
         metadata = self._build_metadata(identity, context)
 
-        # Parent worker.execute to client.dispatch for top-level tasks. For child
-        # agents, parent to the stored observation id of the calling task.
+        # Parent worker.execute under a durable workflow node. The workflow spans
+        # the logical task across async suspend/resume; worker.execute only spans
+        # one concrete worker execution segment.
         is_resume = (
             "ResumeCommand" in context.current_command.__class__.__name__
             if getattr(context, "current_command", None) is not None
@@ -385,28 +403,55 @@ class LangfusePlugin(Plugin):
             observation_anchor = f"{execution_anchor}:resume:{resume_parent}"
 
         root_parent_id = metadata.get(LANGFUSE_PARENT_OBSERVATION_METADATA_KEY)
-        if not identity.parent_message_id and is_resume:
-            # For top-level task resumption, do not parent to any observation id
-            # (especially to avoid parenting back to its own first stage which is in metadata).
-            # This lets Langfuse automatically root it under the main trace.
-            worker_execute_parent = ""
-        elif root_parent_id:
-            worker_execute_parent = str(root_parent_id)
-        elif identity.parent_message_id:
-            worker_execute_parent = (
-                await observation_store.get_observation_id(
-                    identity.session_id, identity.parent_message_id
-                )
-                or ""
+        workflow_root_parent_id = (
+            ""
+            if is_resume and not identity.parent_message_id
+            else str(root_parent_id or "")
+        )
+        workflow_key = (identity.session_id, identity.message_id)
+        workflow_obs = self._active_workflows.get(workflow_key)
+        if workflow_obs is not None:
+            self._active_workflows.move_to_end(workflow_key)
+        workflow_span_id = str_to_uint64(f"{execution_anchor}:agent.workflow")
+        workflow_observation_id = f"{workflow_span_id:016x}"
+
+        if workflow_obs is None:
+            workflow_parent = await self._resolve_parent_observation_id(
+                identity=identity,
+                observation_store=observation_store,
+                root_parent_id=workflow_root_parent_id,
+                excluded_parent_id=workflow_observation_id,
             )
-        else:
-            worker_execute_parent = ""
+            workflow_obs = tracer.start_observation(
+                _ObservationStartRequest(
+                    span_id=workflow_span_id,
+                    trace_id=trace_id_hex,
+                    parent_observation_id=workflow_parent,
+                    name=f"agent.workflow:{identity.agent_id}",
+                    observation_input=command_input,
+                    metadata=metadata,
+                )
+            )
+            if workflow_obs is not None:
+                self._active_workflows[workflow_key] = workflow_obs
+                self._evict_active_workflows_if_needed()
+
+        header_metadata = metadata.get("header_metadata", {})
+        framework_parent_span_id = (
+            str(header_metadata.get("framework_parent_span_id", "") or "")
+            if isinstance(header_metadata, dict)
+            else ""
+        )
+        is_agent_return_resume = framework_parent_span_id.endswith(":agent.return")
+        worker_parent_observation_id = workflow_obs.id if workflow_obs else ""
+        if is_resume and is_agent_return_resume and root_parent_id:
+            worker_parent_observation_id = str(root_parent_id)
 
         worker_execute_obs = tracer.start_observation(
             _ObservationStartRequest(
                 span_id=str_to_uint64(f"{observation_anchor}:worker.execute"),
                 trace_id=trace_id_hex,
-                parent_observation_id=worker_execute_parent,
+                parent_observation_id=worker_parent_observation_id,
                 name="worker.execute",
                 observation_input=command_input,
                 metadata=metadata,
@@ -427,16 +472,26 @@ class LangfusePlugin(Plugin):
         )
 
         setattr(context, LANGFUSE_OBSERVATION_ATTR, observation)
+        setattr(context, LANGFUSE_WORKFLOW_OBSERVATION_ATTR, workflow_obs)
+        setattr(context, LANGFUSE_CALL_PARENT_OBSERVATION_ATTR, workflow_obs)
         setattr(context, WORKER_EXECUTE_OBSERVATION_ATTR, worker_execute_obs)
+        if observation is not None and hasattr(
+            context, "set_trace_parent_observation_id"
+        ):
+            context.set_trace_parent_observation_id(observation.id)
         # Child agents resolve this task through parent_message_id and nest under
-        # agent.task.
-        await observation_store.set_observation_id(
-            identity.session_id, identity.message_id, observation.id
-        )
+        # the durable workflow instead of a worker segment that may end on suspend.
+        if workflow_obs is not None:
+            await observation_store.set_observation_id(
+                identity.session_id, identity.message_id, workflow_obs.id
+            )
 
     async def on_task_complete(self, context: Any, result: Any) -> None:
         serialized_output = self._serialize_value(result)
+        self._update_observation_usage(context)
         self._end_observation(context, output=serialized_output)
+        if not self._is_non_terminal_result(result):
+            self._end_workflow_observation(context, output=serialized_output)
         self._update_trace_output(context, output=serialized_output)
 
     async def on_task_error(self, context: Any, error: Exception) -> None:
@@ -450,6 +505,7 @@ class LangfusePlugin(Plugin):
             context,
             output={"error": str(error)},
         )
+        self._end_workflow_observation(context, output={"error": str(error)})
         self._update_trace_output(context, output={"error": str(error)})
 
     async def on_task_cancel(self, context: Any, command: Any) -> None:
@@ -464,10 +520,215 @@ class LangfusePlugin(Plugin):
             context,
             output={"cancelled": True, "reason": reason},
         )
+        self._end_workflow_observation(
+            context,
+            output={"cancelled": True, "reason": reason},
+        )
         self._update_trace_output(
             context,
             output={"cancelled": True, "reason": reason},
         )
+
+    async def on_call_agent_start(self, context: Any, command: Any) -> None:
+        """Create a call observation and pass it as the child task parent."""
+        tracer = self._get_tracer()
+        header = getattr(command, "header", None)
+        if header is None:
+            return
+
+        trace_id = getattr(header, "trace_id", "") or getattr(context, "trace_id", "")
+        message_id = str(getattr(header, "message_id", "") or "")
+        if not trace_id or not message_id:
+            return
+
+        parent_observation_id = getattr(
+            header, "langfuse_parent_observation_id", ""
+        ) or getattr(header, "metadata", {}).get(
+            LANGFUSE_PARENT_OBSERVATION_METADATA_KEY, ""
+        )
+        target_agent_type = str(getattr(header, "target_agent_type", "") or "")
+        metadata = {
+            "message_id": message_id,
+            "parent_message_id": str(getattr(header, "parent_message_id", "") or ""),
+            "session_id": str(getattr(header, "session_id", "") or ""),
+            "trace_id": trace_id,
+            "source_agent_type": str(getattr(header, "source_agent_type", "") or ""),
+            "target_agent_type": target_agent_type,
+            "header_metadata": self._serialize_value(getattr(header, "metadata", {})),
+        }
+        observation = tracer.start_observation(
+            _ObservationStartRequest(
+                span_id=str_to_uint64(f"{message_id}:client.dispatch"),
+                trace_id=f"{str_to_uint128(trace_id):032x}",
+                parent_observation_id=str(parent_observation_id or ""),
+                name=f"agent.call_agent:{target_agent_type}",
+                observation_input=self._serialize_value(
+                    getattr(command, "content", None)
+                ),
+                metadata=metadata,
+            )
+        )
+        if observation is None:
+            return
+
+        setattr(command, "_langfuse_call_observation", observation)
+        header.langfuse_parent_observation_id = observation.id
+        header.metadata[LANGFUSE_PARENT_OBSERVATION_METADATA_KEY] = observation.id
+
+    async def on_call_agent_complete(
+        self,
+        context: Any,
+        command: Any,
+        result: Any,
+    ) -> None:
+        del context
+        observation = getattr(command, "_langfuse_call_observation", None)
+        if observation is None:
+            return
+        output = self._serialize_value(result)
+        try:
+            observation.end(output=output)
+        except TypeError:
+            observation.update(output=output)
+            observation.end()
+
+    async def on_call_agent_error(
+        self,
+        context: Any,
+        command: Any,
+        error: Exception,
+    ) -> None:
+        del context
+        observation = getattr(command, "_langfuse_call_observation", None)
+        if observation is None:
+            return
+        output = {"error": str(error)}
+        try:
+            observation.update(level="ERROR", status_message=str(error), output=output)
+            observation.end()
+        except TypeError:
+            observation.end(output=output)
+
+    async def on_agent_return_start(
+        self,
+        context: Any,
+        command: Any,
+        callback_command: Any,
+    ) -> None:
+        """Create a return observation and pass it as the resume parent."""
+        del context, command
+        tracer = self._get_tracer()
+        header = getattr(callback_command, "header", None)
+        if header is None:
+            return
+
+        trace_id = str(getattr(header, "trace_id", "") or "")
+        framework_parent_span_id = str(
+            getattr(header, "metadata", {}).get("framework_parent_span_id", "") or ""
+        )
+        if not trace_id or not framework_parent_span_id:
+            return
+
+        parent_observation_id = getattr(
+            header, "langfuse_parent_observation_id", ""
+        ) or getattr(header, "metadata", {}).get(
+            LANGFUSE_PARENT_OBSERVATION_METADATA_KEY, ""
+        )
+        source_agent_type = str(getattr(header, "source_agent_type", "") or "")
+        target_agent_type = str(getattr(header, "target_agent_type", "") or "")
+        metadata = {
+            "message_id": str(getattr(header, "message_id", "") or ""),
+            "parent_message_id": str(getattr(header, "parent_message_id", "") or ""),
+            "session_id": str(getattr(header, "session_id", "") or ""),
+            "trace_id": trace_id,
+            "source_agent_type": source_agent_type,
+            "target_agent_type": target_agent_type,
+            "return_from_agent_type": source_agent_type,
+            "return_to_agent_type": target_agent_type,
+            "return_route": f"{source_agent_type}->{target_agent_type}",
+            "header_metadata": self._serialize_value(getattr(header, "metadata", {})),
+        }
+        observation = tracer.start_observation(
+            _ObservationStartRequest(
+                span_id=str_to_uint64(framework_parent_span_id),
+                trace_id=f"{str_to_uint128(trace_id):032x}",
+                parent_observation_id=str(parent_observation_id or ""),
+                name="agent.return",
+                observation_input=self._serialize_value(
+                    {
+                        "status": getattr(callback_command, "status", ""),
+                        "content": getattr(callback_command, "content", ""),
+                        "reply_data": getattr(callback_command, "reply_data", {}),
+                    }
+                ),
+                metadata=metadata,
+            )
+        )
+        if observation is None:
+            return
+
+        setattr(callback_command, "_langfuse_return_observation", observation)
+        header.langfuse_parent_observation_id = observation.id
+        header.metadata[LANGFUSE_PARENT_OBSERVATION_METADATA_KEY] = observation.id
+
+    async def on_agent_return_complete(
+        self,
+        context: Any,
+        command: Any,
+        callback_command: Any,
+    ) -> None:
+        del context, command
+        observation = getattr(callback_command, "_langfuse_return_observation", None)
+        if observation is None:
+            return
+        output = self._serialize_value(
+            {
+                "status": getattr(callback_command, "status", ""),
+                "reply_data": getattr(callback_command, "reply_data", {}),
+            }
+        )
+        try:
+            observation.end(output=output)
+        except TypeError:
+            observation.update(output=output)
+            observation.end()
+
+    async def on_agent_return_error(
+        self,
+        context: Any,
+        command: Any,
+        callback_command: Any,
+        error: Exception,
+    ) -> None:
+        del context, command
+        observation = getattr(callback_command, "_langfuse_return_observation", None)
+        if observation is None:
+            return
+        output = {"error": str(error)}
+        try:
+            observation.update(level="ERROR", status_message=str(error), output=output)
+            observation.end()
+        except TypeError:
+            observation.end(output=output)
+
+    async def _resolve_parent_observation_id(
+        self,
+        *,
+        identity: _TaskIdentity,
+        observation_store: ObservationStore,
+        root_parent_id: str,
+        excluded_parent_id: str,
+    ) -> str:
+        """Resolve the parent observation for a durable workflow span."""
+        if root_parent_id and root_parent_id != excluded_parent_id:
+            return root_parent_id
+        if identity.parent_message_id:
+            parent_id = await observation_store.get_observation_id(
+                identity.session_id, identity.parent_message_id
+            )
+            if parent_id and parent_id != excluded_parent_id:
+                return parent_id
+        return ""
 
     def _get_tracer(self) -> LangfuseTracer:
         tracer = self._tracer or self._build_default_tracer()
@@ -519,11 +780,21 @@ class LangfusePlugin(Plugin):
     def _build_task_identity(context: Any) -> _TaskIdentity:
         command = getattr(context, "current_command", None)
         header = getattr(command, "header", None)
+        is_resume = (
+            "ResumeCommand" in command.__class__.__name__
+            if command is not None
+            else False
+        )
+        parent_message_id = getattr(context, "parent_message_id", "")
+        if is_resume and header is not None:
+            parent_message_id = (
+                getattr(header, "parent_message_id", "") or parent_message_id
+            )
         return _TaskIdentity(
             session_id=getattr(context, "session_id", ""),
             trace_id=getattr(context, "trace_id", ""),
             message_id=getattr(context, "message_id", ""),
-            parent_message_id=getattr(context, "parent_message_id", ""),
+            parent_message_id=parent_message_id,
             agent_id=(
                 getattr(context, "current_agent_id", "")
                 or getattr(header, "target_agent_type", "")
@@ -563,6 +834,23 @@ class LangfusePlugin(Plugin):
             metadata[LANGFUSE_PARENT_OBSERVATION_METADATA_KEY] = str(
                 langfuse_parent_observation_id
             )
+        if isinstance(header_metadata, dict):
+            framework_parent_span_id = str(
+                header_metadata.get("framework_parent_span_id", "") or ""
+            )
+            if (
+                framework_parent_span_id.endswith(":agent.return")
+                and header is not None
+            ):
+                metadata["resume_via"] = "agent.return"
+                metadata["resume_from_agent_type"] = str(
+                    getattr(header, "source_agent_type", "") or ""
+                )
+                metadata["resume_to_agent_type"] = str(
+                    getattr(header, "target_agent_type", "") or identity.agent_id
+                )
+                metadata["resume_parent_message_id"] = identity.parent_message_id
+                metadata["resume_return_span_id"] = framework_parent_span_id
         return metadata
 
     @staticmethod
@@ -602,6 +890,30 @@ class LangfusePlugin(Plugin):
                 observations.append(observation)
         return observations
 
+    def _update_observation_usage(self, context: Any) -> None:
+        """Write accumulated token usage onto the worker.execute observation."""
+        try:
+            get_usage = getattr(context, "get_token_usage", None)
+            token_usage = get_usage() if callable(get_usage) else {}
+        except Exception:  # pylint: disable=broad-exception-caught
+            return
+        if not token_usage:
+            return
+        observation = getattr(context, WORKER_EXECUTE_OBSERVATION_ATTR, None)
+        if observation is None:
+            return
+        try:
+            observation.update(
+                usage={
+                    "input": token_usage.get("prompt_tokens", 0),
+                    "output": token_usage.get("completion_tokens", 0),
+                    "total": token_usage.get("total_tokens", 0),
+                    "unit": "TOKENS",
+                }
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
     def _end_observation(self, context: Any, *, output: Any) -> None:
         serialized_output = self._serialize_value(output)
         for observation in self._iter_context_observations(context):
@@ -610,6 +922,44 @@ class LangfusePlugin(Plugin):
             except TypeError:
                 observation.update(output=serialized_output)
                 observation.end()
+
+    def _end_workflow_observation(self, context: Any, *, output: Any) -> None:
+        observation = getattr(context, LANGFUSE_WORKFLOW_OBSERVATION_ATTR, None)
+        if observation is None:
+            return
+
+        serialized_output = self._serialize_value(output)
+        try:
+            observation.end(output=serialized_output)
+        except TypeError:
+            observation.update(output=serialized_output)
+            observation.end()
+
+        key = (
+            str(getattr(context, "session_id", "")),
+            str(getattr(context, "message_id", "")),
+        )
+        if self._active_workflows.get(key) is observation:
+            self._active_workflows.pop(key, None)
+
+    def _evict_active_workflows_if_needed(self) -> None:
+        while len(self._active_workflows) > self._max_active_workflows:
+            _, observation = self._active_workflows.popitem(last=False)
+            try:
+                observation.update(
+                    level="WARNING",
+                    status_message="workflow evicted from active workflow cache",
+                )
+                observation.end()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+
+    @staticmethod
+    def _is_non_terminal_result(result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        status = str(result.get("status", ""))
+        return status == "QUEUED" or status.startswith("QUEUED:")
 
     def _update_trace_output(self, context: Any, *, output: Any) -> None:
         tracer = self._tracer
@@ -622,7 +972,28 @@ class LangfusePlugin(Plugin):
 
         try:
             trace_id_hex = f"{str_to_uint128(trace_id):032x}"
-            tracer.update_trace_output(trace_id_hex, self._serialize_value(output))
+            serialized_output = self._serialize_value(output)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                tracer.update_trace_output(trace_id_hex, serialized_output)
+                return
+            future = loop.run_in_executor(
+                None,
+                tracer.update_trace_output,
+                trace_id_hex,
+                serialized_output,
+            )
+            self._pending_trace_output_updates.add(future)
+
+            def _discard_done(done: asyncio.Future[Any]) -> None:
+                self._pending_trace_output_updates.discard(done)
+                try:
+                    done.result()
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+
+            future.add_done_callback(_discard_done)
         except Exception:  # pylint: disable=broad-exception-caught
             pass
 
@@ -663,19 +1034,23 @@ def start_client_dispatch_observation(
     except ImportError:
         return None
 
-    langfuse_client_cls = getattr(langfuse_module, "Langfuse")
-    try:
-        client = langfuse_client_cls(
-            public_key=config.public_key,
-            secret_key=config.secret_key,
-            base_url=config.base_url,
-        )
-    except TypeError:
-        client = langfuse_client_cls(
-            public_key=config.public_key,
-            secret_key=config.secret_key,
-            host=config.base_url,
-        )
+    tracer = _CLIENT_DISPATCH_TRACER_CACHE.get(config)
+    if tracer is None:
+        langfuse_client_cls = getattr(langfuse_module, "Langfuse")
+        try:
+            client = langfuse_client_cls(
+                public_key=config.public_key,
+                secret_key=config.secret_key,
+                base_url=config.base_url,
+            )
+        except TypeError:
+            client = langfuse_client_cls(
+                public_key=config.public_key,
+                secret_key=config.secret_key,
+                host=config.base_url,
+            )
+        tracer = _SdkLangfuseTracer(client, config)
+        _CLIENT_DISPATCH_TRACER_CACHE[config] = tracer
 
     trace_id_hex = f"{str_to_uint128(trace_id):032x}"
     dispatch_metadata = {
@@ -687,7 +1062,7 @@ def start_client_dispatch_observation(
         "user_name": user_name,
         "header_metadata": LangfusePlugin._serialize_value(metadata or {}),
     }
-    return _SdkLangfuseTracer(client, config).start_observation(
+    return tracer.start_observation(
         _ObservationStartRequest(
             span_id=str_to_uint64(f"{message_id}:client.dispatch"),
             trace_id=trace_id_hex,

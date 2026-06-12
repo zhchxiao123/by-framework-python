@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 
@@ -66,6 +65,7 @@ class FakeRedis:
 
 
 class _FakePipeline:
+
     def __init__(self, redis):
         self._redis = redis
         self._cmds = []
@@ -74,6 +74,7 @@ class _FakePipeline:
         def _cmd(*args, **kwargs):
             self._cmds.append((name, args, kwargs))
             return self
+
         return _cmd
 
     async def execute(self):
@@ -84,7 +85,9 @@ class _FakePipeline:
 async def test_collector_acquires_lock_and_writes_history():
     """MetricsCollector writes a history point when it acquires the lock."""
     redis = FakeRedis()
-    collector = MetricsCollector(redis, worker_id="w1", interval_seconds=1, enabled=True)
+    collector = MetricsCollector(
+        redis, worker_id="w1", interval_seconds=1, enabled=True
+    )
     await collector._collect_once()
 
     assert COLLECTOR_LOCK_KEY in redis.store
@@ -101,7 +104,9 @@ async def test_collector_lock_exclusion():
     redis.store[COLLECTOR_LOCK_KEY] = "w-other"
     zsets_before = dict(redis.zsets)
 
-    collector = MetricsCollector(redis, worker_id="w2", interval_seconds=1, enabled=True)
+    collector = MetricsCollector(
+        redis, worker_id="w2", interval_seconds=1, enabled=True
+    )
     await collector._collect_once()
 
     # History key should NOT have grown because w2 did not hold the lock
@@ -122,7 +127,9 @@ async def test_collector_renews_own_lock():
 
     redis.expire = tracking_expire
 
-    collector = MetricsCollector(redis, worker_id="w1", interval_seconds=1, enabled=True)
+    collector = MetricsCollector(
+        redis, worker_id="w1", interval_seconds=1, enabled=True
+    )
     await collector._collect_once()
 
     assert any(k == COLLECTOR_LOCK_KEY for k, _ in expire_calls)
@@ -132,7 +139,9 @@ async def test_collector_renews_own_lock():
 async def test_collector_releases_lock_on_stop():
     """Lock is released when the collector task is cancelled."""
     redis = FakeRedis()
-    collector = MetricsCollector(redis, worker_id="w1", interval_seconds=60, enabled=True)
+    collector = MetricsCollector(
+        redis, worker_id="w1", interval_seconds=60, enabled=True
+    )
 
     task = asyncio.create_task(collector.run())
     await asyncio.sleep(0.05)
@@ -146,7 +155,9 @@ async def test_collector_releases_lock_on_stop():
 async def test_collector_disabled_does_not_write():
     """When disabled the collector writes nothing."""
     redis = FakeRedis()
-    collector = MetricsCollector(redis, worker_id="w1", interval_seconds=1, enabled=False)
+    collector = MetricsCollector(
+        redis, worker_id="w1", interval_seconds=1, enabled=False
+    )
     await collector._collect_once()
 
     assert REDIS_HISTORY_KEY not in redis.zsets

@@ -65,16 +65,20 @@ class MetricsCollector:
     ) -> None:
         self.redis = redis_client or get_redis()
         self.worker_id = worker_id or f"collector-{id(self)}"
-        self.interval_seconds = interval_seconds if interval_seconds is not None else (
-            _env_int("BY_FRAMEWORK_METRICS_HISTORY_INTERVAL_SECONDS", 5)
+        self.interval_seconds = (
+            interval_seconds
+            if interval_seconds is not None
+            else (_env_int("BY_FRAMEWORK_METRICS_HISTORY_INTERVAL_SECONDS", 5))
         )
-        self.enabled = enabled if enabled is not None else (
-            _env_bool("BY_FRAMEWORK_METRICS_HISTORY_ENABLED", default=True)
-            and _env_bool("BY_FRAMEWORK_OBSERVABILITY_ENABLED", default=True)
+        self.enabled = (
+            enabled
+            if enabled is not None
+            else (
+                _env_bool("BY_FRAMEWORK_METRICS_HISTORY_ENABLED", default=True)
+                and _env_bool("BY_FRAMEWORK_OBSERVABILITY_ENABLED", default=True)
+            )
         )
-        self._lock_ttl_seconds = max(
-            self.interval_seconds * _LOCK_TTL_MULTIPLIER, 15
-        )
+        self._lock_ttl_seconds = max(self.interval_seconds * _LOCK_TTL_MULTIPLIER, 15)
 
     async def run(self) -> None:
         """Run the collection loop until cancelled."""
@@ -115,11 +119,8 @@ class MetricsCollector:
         Tries to SET NX first; if the key already exists, checks whether *this*
         worker owns it and, if so, refreshes the TTL.
         """
-        set_fn = getattr(self.redis, "set", None)
-        if not callable(set_fn):
-            return False
         try:
-            acquired = await set_fn(
+            acquired = await self.redis.set(
                 COLLECTOR_LOCK_KEY,
                 self.worker_id,
                 nx=True,
@@ -128,15 +129,12 @@ class MetricsCollector:
             if acquired:
                 return True
             # Already exists — check ownership and refresh
-            get_fn = getattr(self.redis, "get", None)
-            expire_fn = getattr(self.redis, "expire", None)
-            if callable(get_fn) and callable(expire_fn):
-                current = await get_fn(COLLECTOR_LOCK_KEY)
-                if isinstance(current, bytes):
-                    current = current.decode()
-                if current == self.worker_id:
-                    await expire_fn(COLLECTOR_LOCK_KEY, self._lock_ttl_seconds)
-                    return True
+            current = await self.redis.get(COLLECTOR_LOCK_KEY)
+            if isinstance(current, bytes):
+                current = current.decode()
+            if current == self.worker_id:
+                await self.redis.expire(COLLECTOR_LOCK_KEY, self._lock_ttl_seconds)
+                return True
             return False
         except Exception as err:  # pylint: disable=broad-exception-caught
             logger.debug("MetricsCollector lock acquire failed: %s", err)
@@ -145,15 +143,11 @@ class MetricsCollector:
     async def _release_lock(self) -> None:
         """Release the lock only if this worker still owns it."""
         try:
-            get_fn = getattr(self.redis, "get", None)
-            delete_fn = getattr(self.redis, "delete", None)
-            if not callable(get_fn) or not callable(delete_fn):
-                return
-            current = await get_fn(COLLECTOR_LOCK_KEY)
+            current = await self.redis.get(COLLECTOR_LOCK_KEY)
             if isinstance(current, bytes):
                 current = current.decode()
             if current == self.worker_id:
-                await delete_fn(COLLECTOR_LOCK_KEY)
+                await self.redis.delete(COLLECTOR_LOCK_KEY)
         except Exception as err:  # pylint: disable=broad-exception-caught
             logger.debug("MetricsCollector lock release failed: %s", err)
 

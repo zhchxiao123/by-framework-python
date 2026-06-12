@@ -234,7 +234,6 @@ async def test_span_recorder_records_export_failures():
     assert diagnostics["export_failures_by_exporter"]["FailingExporter"] == 1
 
 
-
 def test_sanitize_io_value_truncates_long_strings():
     """sanitize_io_value truncates strings exceeding io_value_max_length."""
     config = ObservabilityConfig(io_value_max_length=10)

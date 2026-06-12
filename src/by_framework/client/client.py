@@ -633,19 +633,19 @@ class GatewayClient:
             message_id = f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}"
         if not trace_id:
             trace_id = uuid.uuid4().hex
-        _trace_start_ts = int(time.time() * 1000)
-        _is_root_dispatch = not params.get("parent_message_id", "")
+        trace_start_ts = int(time.time() * 1000)
+        is_root_dispatch = not params.get("parent_message_id", "")
 
         # Write trace root start so the trace is visible even before the worker
         # picks up the task.  Only written for root dispatches (no parent).
-        if _is_root_dispatch:
+        if is_root_dispatch:
             await self._write_trace_root_start(
                 trace_id=trace_id,
                 message_id=message_id,
                 session_id=str(params.get("session_id", "")),
                 target_agent_type=str(params.get("target_agent_type", "")),
                 content=params.get("content"),
-                start_ts=_trace_start_ts,
+                start_ts=trace_start_ts,
             )
 
         metadata = dict(params.get("metadata", {}) or {})
@@ -773,7 +773,7 @@ class GatewayClient:
                         output={"success": False, "error": availability.error},
                         error=availability.error,
                     )
-                    if _is_root_dispatch:
+                    if is_root_dispatch:
                         await self._write_trace_root_end(
                             trace_id=trace_id,
                             status="FAILED",
@@ -796,7 +796,7 @@ class GatewayClient:
                 output={"success": False, "error": str(err)},
                 error=str(err),
             )
-            if _is_root_dispatch:
+            if is_root_dispatch:
                 await self._write_trace_root_end(
                     trace_id=trace_id,
                     status="FAILED",
@@ -819,7 +819,7 @@ class GatewayClient:
                 output={"success": False, "error": str(err)},
                 error=str(err),
             )
-            if _is_root_dispatch:
+            if is_root_dispatch:
                 await self._write_trace_root_end(
                     trace_id=trace_id,
                     status="FAILED",

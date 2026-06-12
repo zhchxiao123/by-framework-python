@@ -703,18 +703,58 @@ class WorkerRunner:
         except Exception:  # pylint: disable=broad-exception-caught
             pass
 
+    async def _claim_worker_id_with_retry(
+        self,
+        max_wait_seconds: Optional[float] = None,
+        retry_interval_seconds: Optional[float] = None,
+    ) -> str:
+        """Claim the worker ID, retrying if another instance holds it.
+
+        Retries are useful for crash-recovery: if Worker 1 just died its lease
+        will expire within one TTL period.  Worker 2 keeps trying until the
+        lease is gone or max_wait_seconds is exhausted.
+        """
+        if max_wait_seconds is None:
+            max_wait_seconds = WorkerConfig.worker_id_claim_max_wait_seconds
+        if retry_interval_seconds is None:
+            retry_interval_seconds = WorkerConfig.worker_id_claim_retry_interval_seconds
+
+        deadline = time.monotonic() + max_wait_seconds
+        attempt = 0
+        while True:
+            try:
+                return await self.worker.registry.claim_worker_id(
+                    self.worker.worker_id,
+                    ttl_seconds=self.worker.heartbeat_lease_ttl_seconds,
+                )
+            except ValueError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                wait = min(
+                    retry_interval_seconds * (2 ** min(attempt, 3)), remaining, 10.0
+                )
+                logger.info(
+                    "[%s] Worker ID already claimed; will retry in %.1fs "
+                    "(%.0fs remaining)",
+                    self.worker.worker_id,
+                    wait,
+                    remaining,
+                )
+                await asyncio.sleep(wait)
+                attempt += 1
+
     async def start(self):
         """Start the worker runner main loop."""
         self._running_tasks = set()
         try:
             if hasattr(self.worker.registry, "claim_worker_id"):
-                self._lock_token = await self.worker.registry.claim_worker_id(
-                    self.worker.worker_id
-                )
+                self._lock_token = await self._claim_worker_id_with_retry()
 
             await self.setup_streams()
             await self.setup_control_streams()
             await self.worker.start_heartbeat()
+            heartbeat_task = self.worker.heartbeat_task
             self._control_task = asyncio.create_task(self._control_loop())
             try:
                 from by_framework.metrics.collector import MetricsCollector
@@ -725,8 +765,8 @@ class WorkerRunner:
                         worker_id=self.worker.worker_id,
                     ).run()
                 )
-            except Exception as _mc_err:  # pylint: disable=broad-exception-caught
-                logger.debug("MetricsCollector not started: %s", _mc_err)
+            except Exception as metrics_collector_err:  # pylint: disable=broad-exception-caught
+                logger.debug("MetricsCollector not started: %s", metrics_collector_err)
             logger.info(
                 "[%s] Runner started with max_concurrency=%d, waiting for tasks...",
                 self.worker.worker_id,
@@ -734,6 +774,10 @@ class WorkerRunner:
             )
 
             while True:
+                if heartbeat_task and heartbeat_task.done():
+                    exc = heartbeat_task.exception()
+                    if exc:
+                        raise exc
                 await self._run_once()
                 await asyncio.sleep(CONTROL_LOOP_SLEEP_SECONDS)
         finally:
@@ -761,7 +805,9 @@ class WorkerRunner:
                 self.worker.worker_id,
                 self._lock_token,
             )
-        elif hasattr(self.worker.registry, "mark_worker_inactive"):
+        elif not hasattr(self.worker.registry, "claim_worker_id") and hasattr(
+            self.worker.registry, "mark_worker_inactive"
+        ):
             await self.worker.registry.mark_worker_inactive(self.worker.worker_id)
             released_worker_id = True
 

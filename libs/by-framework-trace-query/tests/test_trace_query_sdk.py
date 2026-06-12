@@ -911,12 +911,11 @@ async def test_trace_write_client_records_trace_root_start():
         )
     )
 
-    from by_framework.common.constants import RedisKeys
-    from by_framework.trace.trace_schema import decode_redis_value
-
     meta = {
         k.decode() if isinstance(k, bytes) else k: decode_redis_value(v)
-        for k, v in (await redis.hgetall(RedisKeys.trace_meta("trace-root-start"))).items()
+        for k, v in (
+            await redis.hgetall(RedisKeys.trace_meta("trace-root-start"))
+        ).items()
     }
     assert meta["trace_id"] == "trace-root-start"
     assert meta["status"] == "QUEUED"
@@ -951,12 +950,11 @@ async def test_trace_write_client_records_trace_root_end():
         )
     )
 
-    from by_framework.common.constants import RedisKeys
-    from by_framework.trace.trace_schema import decode_redis_value
-
     meta = {
         k.decode() if isinstance(k, bytes) else k: decode_redis_value(v)
-        for k, v in (await redis.hgetall(RedisKeys.trace_meta("trace-root-end"))).items()
+        for k, v in (
+            await redis.hgetall(RedisKeys.trace_meta("trace-root-end"))
+        ).items()
     }
     assert meta["status"] == "COMPLETED"
     assert int(meta["end_ts"]) == 5000
@@ -978,10 +976,6 @@ async def test_trace_read_client_returns_start_ts_from_trace_record():
             start_ts=2000,
         )
     )
-    # Also write a span so the trace is readable
-    from by_framework_trace_query.redis_source import RedisTraceSource
-
-    source = RedisTraceSource(redis)
     from by_framework_trace_query.client import TraceReadClient as TRC
 
     client = TRC(redis_client=redis)

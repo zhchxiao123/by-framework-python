@@ -96,6 +96,16 @@ class GatewayClient:
         )
         self.interceptors = interceptors or []
         self.span_recorder = span_recorder or SpanRecorder(self.redis)
+        self._langfuse_dispatch_fn = self._resolve_langfuse_dispatch_fn()
+
+    @staticmethod
+    def _resolve_langfuse_dispatch_fn() -> Any:
+        try:
+            from by_framework_trace_langfuse import start_client_dispatch_observation
+
+            return start_client_dispatch_observation
+        except ImportError:
+            return None
 
     def add_interceptor(self, interceptor: GatewayInterceptor):
         self.interceptors.append(interceptor)
@@ -619,7 +629,7 @@ class GatewayClient:
             )
 
         langfuse_client_dispatch = None
-        if not params["parent_message_id"]:
+        if not langfuse_parent_observation_id:
             langfuse_client_dispatch = self._start_langfuse_client_dispatch_observation(
                 trace_id=trace_id,
                 message_id=message_id,
@@ -631,8 +641,7 @@ class GatewayClient:
                 metadata=metadata,
             )
             observation_id = getattr(langfuse_client_dispatch, "id", "")
-            if observation_id:
-                langfuse_parent_observation_id = observation_id
+            langfuse_parent_observation_id = observation_id or trace_parent_span_id
 
         header = MessageHeader(
             message_id=message_id,
@@ -860,10 +869,10 @@ class GatewayClient:
         content: Any,
         metadata: Dict[str, Any],
     ) -> Any:
+        if self._langfuse_dispatch_fn is None:
+            return None
         try:
-            from by_framework_trace_langfuse import start_client_dispatch_observation
-
-            return start_client_dispatch_observation(
+            return self._langfuse_dispatch_fn(
                 trace_id=trace_id,
                 message_id=message_id,
                 target_agent_type=target_agent_type,
@@ -877,7 +886,6 @@ class GatewayClient:
             logger.warning(
                 "Langfuse client.dispatch observation skipped: %s",
                 err,
-                exc_info=True,
             )
             return None
 

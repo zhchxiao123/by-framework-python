@@ -8,6 +8,8 @@ on:
       - "by-framework-history-byclaw-v*"
       - "by-framework-trace-langfuse-v*"
       - "by-framework-trace-phoenix-v*"
+      - "by-framework-trace-query-v*"
+      - "by-framework-dashboard-v*"
       - "by-framework-langgraph-v*"
       - "by-framework-adk-v*"
 
@@ -53,6 +55,16 @@ jobs:
               echo "package_name=by-framework-trace-phoenix" >> "$GITHUB_OUTPUT"
               echo "package_dir=libs/by-framework-trace-phoenix" >> "$GITHUB_OUTPUT"
               echo "version=${REF_NAME#by-framework-trace-phoenix-v}" >> "$GITHUB_OUTPUT"
+              ;;
+            by-framework-trace-query-v*)
+              echo "package_name=by-framework-trace-query" >> "$GITHUB_OUTPUT"
+              echo "package_dir=libs/by-framework-trace-query" >> "$GITHUB_OUTPUT"
+              echo "version=${REF_NAME#by-framework-trace-query-v}" >> "$GITHUB_OUTPUT"
+              ;;
+            by-framework-dashboard-v*)
+              echo "package_name=by-framework-dashboard" >> "$GITHUB_OUTPUT"
+              echo "package_dir=libs/by-framework-dashboard" >> "$GITHUB_OUTPUT"
+              echo "version=${REF_NAME#by-framework-dashboard-v}" >> "$GITHUB_OUTPUT"
               ;;
             by-framework-langgraph-v*)
               echo "package_name=by-framework-langgraph" >> "$GITHUB_OUTPUT"

@@ -2,7 +2,7 @@
 
 import asyncio
 import threading
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from by_framework.common.constants import RedisKeys
 from by_framework.common.logger import logger
@@ -27,6 +27,7 @@ class WorkerHeartbeat:
         registry: Optional[WorkerRegistry] = None,
         interval: int = RedisKeys.WORKER_DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         lease_ttl_seconds: int = RedisKeys.WORKER_DEFAULT_LEASE_TTL_SECONDS,
+        health_check: Optional[Callable[[], bool]] = None,
     ):
         self.worker_id = worker_id
         self.agent_types = agent_types
@@ -34,6 +35,7 @@ class WorkerHeartbeat:
         self.registry = registry or WorkerRegistry(self.redis)
         self.interval = interval
         self.lease_ttl_seconds = lease_ttl_seconds
+        self.health_check = health_check
         self._failure_deadline_seconds = max(
             float(self.interval),
             float(self.lease_ttl_seconds) - float(self.interval),
@@ -46,6 +48,7 @@ class WorkerHeartbeat:
         # Set by the heartbeat thread when it detects the lock was stolen;
         # triggers the watcher task in the main loop.
         self._lock_stolen_event: Optional[asyncio.Event] = None
+        self._failure_reason: str = ""
 
         self._thread: Optional[threading.Thread] = None
         self._thread_stop = threading.Event()
@@ -93,10 +96,11 @@ class WorkerHeartbeat:
     async def _watcher(self):
         """Watcher coroutine: unblocks only when the thread signals lock-stolen."""
         await self._lock_stolen_event.wait()
-        raise RuntimeError(
+        reason = self._failure_reason or (
             f"Worker ID '{self.worker_id}' lock was stolen by another instance; "
             "this process must exit"
         )
+        raise RuntimeError(reason)
 
     # ------------------------------------------------------------------
     # Thread-side implementation
@@ -146,6 +150,16 @@ class WorkerHeartbeat:
             while not self._thread_stop.is_set():
                 if await self._sleep_or_stop(self.interval):
                     break
+                if self.health_check is not None and not self.health_check():
+                    logger.critical(
+                        "[%s] Heartbeat stopping because reader is unhealthy",
+                        self.worker_id,
+                    )
+                    self._signal_lock_stolen(
+                        f"Worker ID '{self.worker_id}' reader is unhealthy; "
+                        "this process must exit"
+                    )
+                    return
                 try:
                     ok = await heartbeat_registry.heartbeat_worker(
                         self.worker_id, self.lease_ttl_seconds
@@ -223,8 +237,10 @@ class WorkerHeartbeat:
             )
             return None
 
-    def _signal_lock_stolen(self) -> None:
+    def _signal_lock_stolen(self, reason: str = "") -> None:
         """Notify the main event loop that the lock has been stolen."""
+        if reason:
+            self._failure_reason = reason
         if (
             self._main_loop
             and not self._main_loop.is_closed()

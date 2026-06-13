@@ -90,9 +90,16 @@ class WorkerRunner:
         self._lock_token = None
         self._heartbeat_task = None
         self._control_task = None
+        self._consumer_task: Optional[asyncio.Task] = None
         self._metrics_collector_task: Optional[asyncio.Task] = None
         self._running_tasks: set[asyncio.Task] = set()
         self._tracker = ExecutionTracker()
+        self._consumer_last_tick_monotonic = 0.0
+        stream_block_seconds = float(WorkerConfig.stream_block_ms) / 1000.0
+        self._consumer_health_timeout_seconds = max(
+            float(self.worker.heartbeat_lease_ttl_seconds) * 2.0,
+            stream_block_seconds * 3.0,
+        )
 
     @property
     def _terminal_execution_states(self) -> frozenset[str]:
@@ -307,6 +314,34 @@ class WorkerRunner:
             await self._process_message_from_dict(stream_name, msg_id, data_dict)
         finally:
             self.semaphore.release()
+
+    def _mark_consumer_tick(self) -> None:
+        """Record that the consumer loop is alive in this process."""
+        self._consumer_last_tick_monotonic = time.monotonic()
+
+    def _is_consumer_healthy(self) -> bool:
+        """Return whether the stream consumer loop is recently alive."""
+        if not self._consumer_task or self._consumer_task.done():
+            return False
+        if self._consumer_last_tick_monotonic <= 0:
+            return False
+        elapsed = time.monotonic() - self._consumer_last_tick_monotonic
+        return elapsed <= self._consumer_health_timeout_seconds
+
+    async def _consume_loop(
+        self,
+        ready_event: Optional[asyncio.Event] = None,
+        start_event: Optional[asyncio.Event] = None,
+    ) -> None:
+        """Main agent-type stream consumption loop."""
+        while True:
+            self._mark_consumer_tick()
+            if ready_event is not None and not ready_event.is_set():
+                ready_event.set()
+            if start_event is not None and not start_event.is_set():
+                await start_event.wait()
+            await self._run_once()
+            await asyncio.sleep(CONTROL_LOOP_SLEEP_SECONDS)
 
     async def _process_message_from_dict(
         self, stream_name: str, msg_id: str, data_dict: dict
@@ -753,9 +788,17 @@ class WorkerRunner:
 
             await self.setup_streams()
             await self.setup_control_streams()
-            await self.worker.start_heartbeat()
-            heartbeat_task = self.worker.heartbeat_task
             self._control_task = asyncio.create_task(self._control_loop())
+            reader_ready = asyncio.Event()
+            reader_start = asyncio.Event()
+            self._consumer_task = asyncio.create_task(
+                self._consume_loop(reader_ready, reader_start)
+            )
+            await reader_ready.wait()
+
+            await self.worker.start_heartbeat(health_check=self._is_consumer_healthy)
+            reader_start.set()
+            heartbeat_task = self.worker.heartbeat_task
             try:
                 from by_framework.metrics.collector import MetricsCollector
 
@@ -778,7 +821,13 @@ class WorkerRunner:
                     exc = heartbeat_task.exception()
                     if exc:
                         raise exc
-                await self._run_once()
+                if self._consumer_task.done():
+                    exc = self._consumer_task.exception()
+                    if exc:
+                        raise exc
+                    raise RuntimeError(
+                        f"Worker '{self.worker.worker_id}' consumer loop stopped"
+                    )
                 await asyncio.sleep(CONTROL_LOOP_SLEEP_SECONDS)
         finally:
             await self._shutdown()
@@ -789,6 +838,10 @@ class WorkerRunner:
             self._metrics_collector_task.cancel()
             await asyncio.gather(self._metrics_collector_task, return_exceptions=True)
             self._metrics_collector_task = None
+        if self._consumer_task:
+            self._consumer_task.cancel()
+            await asyncio.gather(self._consumer_task, return_exceptions=True)
+            self._consumer_task = None
         if self._running_tasks:
             await asyncio.gather(*self._running_tasks, return_exceptions=True)
         if self._control_task:

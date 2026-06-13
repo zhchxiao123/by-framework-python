@@ -888,7 +888,7 @@ def test_build_prometheus_metrics_exports_core_snapshot_values():
     metrics = build_prometheus_metrics(snapshot)
 
     assert "by_framework_workers_online 2" in metrics
-    assert 'by_framework_execution_status_total{status="RUNNING"} 3' in metrics
+    assert 'by_framework_execution_status_current{status="RUNNING"} 3' in metrics
     assert (
         'by_framework_queue_depth{queue_type="agent_type",name="planner",'
         'stream="byai_gateway:ctrl:agent_type:planner"} 4'
@@ -897,7 +897,7 @@ def test_build_prometheus_metrics_exports_core_snapshot_values():
         'by_framework_worker_active_executions{worker_id="worker-planner-1"} 3'
         in metrics
     )
-    assert 'by_framework_alerts_total{severity="warning"} 3' in metrics
+    assert 'by_framework_alerts_current{severity="warning"} 3' in metrics
     assert "by_framework_execution_latency_avg_ms " in metrics
     assert "by_framework_execution_latency_p95_ms " in metrics
     assert "by_framework_execution_queue_latency_p95_ms " in metrics
@@ -907,7 +907,30 @@ def test_build_prometheus_metrics_exports_core_snapshot_values():
         'name="planner",group="agent_engines"} 1'
     ) in metrics
     assert (
-        'by_framework_execution_failure_total{error_type="RuntimeError"} 1' in metrics
+        'by_framework_execution_recent_failures{error_type="RuntimeError"} 1' in metrics
     )
     assert 'by_framework_agent_queue_depth{agent_type="planner"} 4' in metrics
     assert 'by_framework_agent_workers{agent_type="planner"} 1' in metrics
+
+
+def test_build_prometheus_metrics_uses_consistent_metric_contract():
+    """Snapshot metrics keep stable names and Prometheus-compatible types."""
+    metrics = build_prometheus_metrics(build_demo_observability_snapshot())
+    metric_types = {}
+
+    for line in metrics.splitlines():
+        if not line.startswith("# TYPE "):
+            continue
+        _, _, name, metric_type = line.split(maxsplit=3)
+        assert name not in metric_types
+        metric_types[name] = metric_type
+
+    assert metric_types["by_framework_execution_status_current"] == "gauge"
+    assert metric_types["by_framework_execution_recent_failures"] == "gauge"
+    assert metric_types["by_framework_alerts_current"] == "gauge"
+    assert "by_framework_execution_status_total" not in metric_types
+    assert all(
+        metric_type == "counter"
+        for name, metric_type in metric_types.items()
+        if name.endswith("_total")
+    )

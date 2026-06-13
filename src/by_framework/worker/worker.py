@@ -14,7 +14,7 @@ import traceback
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 if TYPE_CHECKING:
     from by_framework.core.registry import WorkerRegistry
@@ -262,7 +262,7 @@ class GatewayWorker(ABC):
                 ) from err
         return snapshot
 
-    async def start_heartbeat(self):
+    async def start_heartbeat(self, health_check: Optional[Callable[[], bool]] = None):
         """Start periodic heartbeat registration"""
         # Call plugin startup hook
         await self.plugin_registry.on_worker_startup(self)
@@ -275,6 +275,7 @@ class GatewayWorker(ABC):
             registry=self.registry,
             interval=self.heartbeat_interval,
             lease_ttl_seconds=self.heartbeat_lease_ttl_seconds,
+            health_check=health_check,
         )
         await self._heartbeat.start()
 

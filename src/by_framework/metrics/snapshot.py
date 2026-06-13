@@ -438,13 +438,13 @@ def build_prometheus_metrics(snapshot: dict[str, Any]) -> str:
     ]
     lines.extend(
         [
-            "# HELP by_framework_execution_status_total Executions by status.",
-            "# TYPE by_framework_execution_status_total gauge",
+            "# HELP by_framework_execution_status_current Current executions by status.",
+            "# TYPE by_framework_execution_status_current gauge",
         ]
     )
     for status, value in sorted(snapshot.get("status_counts", {}).items()):
         lines.append(
-            "by_framework_execution_status_total"
+            "by_framework_execution_status_current"
             f'{{status="{_escape_label(status)}"}} {int(value)}'
         )
 
@@ -533,31 +533,31 @@ def build_prometheus_metrics(snapshot: dict[str, Any]) -> str:
 
     lines.extend(
         [
-            "# HELP by_framework_execution_failure_total "
+            "# HELP by_framework_execution_recent_failures "
             "Recent failed executions by error type.",
-            "# TYPE by_framework_execution_failure_total gauge",
+            "# TYPE by_framework_execution_recent_failures gauge",
         ]
     )
     for error_type, value in sorted(
         snapshot.get("failures", {}).get("by_error_type", {}).items()
     ):
         lines.append(
-            "by_framework_execution_failure_total"
+            "by_framework_execution_recent_failures"
             f'{{error_type="{_escape_label(str(error_type))}"}} {int(value)}'
         )
 
     lines.extend(
         [
-            "# HELP by_framework_alerts_total "
+            "# HELP by_framework_alerts_current "
             "Current derived health alerts by severity.",
-            "# TYPE by_framework_alerts_total gauge",
+            "# TYPE by_framework_alerts_current gauge",
         ]
     )
     alert_counts = _count_alerts_by_severity(snapshot.get("alerts", []))
     for severity, value in sorted(alert_counts.items()):
         severity_label = _escape_label(severity)
         lines.append(
-            f'by_framework_alerts_total{{severity="{severity_label}"}} {value}'
+            f'by_framework_alerts_current{{severity="{severity_label}"}} {value}'
         )
 
     latency = snapshot.get("latency", {})

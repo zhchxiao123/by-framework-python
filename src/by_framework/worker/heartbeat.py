@@ -29,6 +29,7 @@ class WorkerHeartbeat:
         lease_ttl_seconds: int = RedisKeys.WORKER_DEFAULT_LEASE_TTL_SECONDS,
         health_check: Optional[Callable[[], bool]] = None,
         lifecycle_callback: Optional[Callable[[str], None]] = None,
+        denylist_refresh: Optional[Callable[[frozenset], None]] = None,
     ):
         self.worker_id = worker_id
         self.agent_types = agent_types
@@ -39,6 +40,8 @@ class WorkerHeartbeat:
         self.health_check = health_check
         # Called after each successful heartbeat with the latest admin lifecycle value.
         self.lifecycle_callback = lifecycle_callback
+        # Called with the current denied agent_type set after each successful heartbeat.
+        self.denylist_refresh = denylist_refresh
         self._failure_deadline_seconds = max(
             float(self.interval),
             float(self.lease_ttl_seconds) - float(self.interval),
@@ -189,6 +192,16 @@ class WorkerHeartbeat:
                         lifecycle = admin_state.get("lifecycle", "active")
                         if lifecycle:
                             self.lifecycle_callback(lifecycle)
+                    if self.denylist_refresh is not None and hasattr(
+                        heartbeat_registry, "is_worker_denied_for_type"
+                    ):
+                        denied: set[str] = set()
+                        for agent_type in self.agent_types:
+                            if await heartbeat_registry.is_worker_denied_for_type(
+                                agent_type, self.worker_id
+                            ):
+                                denied.add(agent_type)
+                        self.denylist_refresh(frozenset(denied))
                     logger.debug("[%s] Heartbeat sent", self.worker_id)
                 except Exception as exc:  # pylint: disable=broad-exception-caught
                     logger.error("[%s] Heartbeat failed: %s", self.worker_id, exc)

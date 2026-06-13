@@ -266,6 +266,7 @@ class GatewayWorker(ABC):
         self,
         health_check: Optional[Callable[[], bool]] = None,
         lifecycle_callback: Optional[Callable[[str], None]] = None,
+        denylist_refresh: Optional[Callable[[frozenset], None]] = None,
     ):
         """Start periodic heartbeat registration"""
         # Call plugin startup hook
@@ -281,6 +282,7 @@ class GatewayWorker(ABC):
             lease_ttl_seconds=self.heartbeat_lease_ttl_seconds,
             health_check=health_check,
             lifecycle_callback=lifecycle_callback,
+            denylist_refresh=denylist_refresh,
         )
         await self._heartbeat.start()
 

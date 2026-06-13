@@ -104,6 +104,10 @@ class WorkerRunner:
         self._admin_lifecycle: str = "active"
         self._evict_force: bool = False
         self._evict_event: asyncio.Event = asyncio.Event()
+        # In-memory cache of agent_types denied for this worker.
+        # Refreshed by the heartbeat thread every heartbeat interval.
+        # Avoids per-iteration Redis SISMEMBER calls in the consume loop.
+        self._denied_agent_types: frozenset[str] = frozenset()
         self._consumer_last_tick_monotonic = 0.0
         stream_block_seconds = float(WorkerConfig.stream_block_ms) / 1000.0
         self._consumer_health_timeout_seconds = max(
@@ -170,19 +174,25 @@ class WorkerRunner:
             if "BUSYGROUP" not in str(e):
                 raise
 
-    async def _active_agent_type_streams(self) -> dict[str, str]:
-        """Return ctrl streams for agent_types not in the admin denylist."""
-        registry = getattr(self.worker, "registry", None)
-        streams: dict[str, str] = {}
-        for agent_type in self.worker.get_agent_types():
-            if registry and hasattr(registry, "is_worker_denied_for_type"):
-                denied = await registry.is_worker_denied_for_type(
-                    agent_type, self.worker.worker_id
-                )
-                if denied:
-                    continue
-            streams[RedisKeys.ctrl_stream(agent_type)] = STREAM_READ_LAST_ID
-        return streams
+    def _active_agent_type_streams(self) -> dict[str, str]:
+        """Return ctrl streams for agent_types not in the in-memory denylist cache.
+
+        Uses self._denied_agent_types which is refreshed by the heartbeat thread
+        every heartbeat interval.  No Redis I/O on the hot consume path.
+        """
+        return {
+            RedisKeys.ctrl_stream(agent_type): STREAM_READ_LAST_ID
+            for agent_type in self.worker.get_agent_types()
+            if agent_type not in self._denied_agent_types
+        }
+
+    def _update_denied_agent_types(self, denied: frozenset[str]) -> None:
+        """Called by the heartbeat thread to refresh the in-memory denylist cache.
+
+        The assignment of a frozenset reference is atomic in CPython (GIL),
+        so cross-thread updates are safe without an explicit lock.
+        """
+        self._denied_agent_types = denied
 
     async def fetch_messages(
         self, count: int = 10, block: int = None
@@ -195,7 +205,7 @@ class WorkerRunner:
         """
         if block is None:
             block = WorkerConfig.stream_block_ms
-        streams = await self._active_agent_type_streams()
+        streams = self._active_agent_type_streams()
         if not streams:
             await asyncio.sleep(float(block) / 1000.0)
             return []
@@ -867,6 +877,7 @@ class WorkerRunner:
             await self.worker.start_heartbeat(
                 health_check=self._is_consumer_healthy,
                 lifecycle_callback=self._set_admin_lifecycle,
+                denylist_refresh=self._update_denied_agent_types,
             )
             reader_start.set()
             heartbeat_task = self.worker.heartbeat_task

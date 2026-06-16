@@ -581,6 +581,7 @@ class GatewayWorker(ABC):
             layout_builder=self.get_data_layout_builder(),
             is_sub_agent=has_source_agent,
             execution_id=execution.execution_id if execution else "",
+            worker_id=self.worker_id,
         )
         if execution:
             execution.context = context

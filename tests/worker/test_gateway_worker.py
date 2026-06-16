@@ -289,6 +289,7 @@ async def test_worker_injects_decoded_command_into_context(tmp_path):
 
         async def process_command(self, command, context):
             observed["command"] = getattr(context, "current_command", None)
+            observed["worker_id"] = getattr(context, "worker_id", "")
             return {"ok": True}
 
     worker = ContextInspectWorker(
@@ -313,6 +314,7 @@ async def test_worker_injects_decoded_command_into_context(tmp_path):
 
     assert isinstance(observed["command"], ResumeCommand)
     assert observed["command"].reply_data == {"answer": 7}
+    assert observed["worker_id"] == "test-inspect"
 
 
 @pytest.mark.asyncio

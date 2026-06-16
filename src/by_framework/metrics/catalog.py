@@ -317,8 +317,7 @@ _CATALOG: dict[str, MetricDefinition] = {
         unit=MetricUnit.SECONDS,
         description="Current snapshot P95 worker run duration in seconds.",
         interpretation=(
-            "Latency signal for worker processing over the retained snapshot "
-            "window."
+            "Latency signal for worker processing over the retained snapshot " "window."
         ),
     ),
     "by_framework_execution_total_duration_p95_seconds": MetricDefinition(

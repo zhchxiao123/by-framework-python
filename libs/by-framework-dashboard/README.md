@@ -19,6 +19,29 @@ Then open:
 http://127.0.0.1:8765
 ```
 
+## Container Image
+
+Dashboard release tags also publish a GHCR image:
+
+```text
+ghcr.io/<owner>/by-framework-dashboard:<version>
+```
+
+For example, pushing `by-framework-dashboard-v0.1.0` builds and publishes:
+
+```text
+ghcr.io/<owner>/by-framework-dashboard:0.1.0
+ghcr.io/<owner>/by-framework-dashboard:latest
+```
+
+To run the image:
+
+```bash
+docker run --rm -p 8765:8765 \
+  -e REDIS_HOST=host.docker.internal \
+  ghcr.io/<owner>/by-framework-dashboard:0.1.0
+```
+
 For demo data without a live Redis cluster:
 
 ```text

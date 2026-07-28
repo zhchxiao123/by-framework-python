@@ -53,6 +53,8 @@ members = [
     "libs/by-framework-trace-query",
     "libs/by-framework-dashboard",
     "libs/by-framework-adk",
+    "libs/by-framework-model-openai",
+    "libs/by-framework-tools-mcp",
 ]
 
 [tool.uv.sources]
@@ -72,6 +74,8 @@ pythonpath = [
     "libs/by-framework-trace-query/src",
     "libs/by-framework-dashboard/src",
     "libs/by-framework-adk/src",
+    "libs/by-framework-model-openai/src",
+    "libs/by-framework-tools-mcp/src",
 ]
 testpaths = ["tests"]
 

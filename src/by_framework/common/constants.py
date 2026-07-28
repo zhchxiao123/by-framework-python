@@ -41,6 +41,68 @@ class RedisKeys:
     V2_PREFIX = "byai_gateway:v2:"
 
     @classmethod
+    def native_run_commit_keys(cls, run_id: str) -> tuple[str, str]:
+        """State and event keys co-located by a Redis Cluster run hash tag."""
+        if not run_id or "{" in run_id or "}" in run_id:
+            raise ValueError("run_id must be non-empty and cannot contain braces")
+        tag = f"{{{run_id}}}"
+        prefix = (
+            cls.V2_PREFIX
+            if get_key_schema_version() == "v2"
+            else "byai_gateway:native:"
+        )
+        return (
+            f"{prefix}run:{tag}:state",
+            f"{prefix}run:{tag}:events",
+        )
+
+    @classmethod
+    def native_run_coordinator(cls, run_id: str) -> str:
+        """Coordinator/step lease hash co-located with a native run."""
+        return f"{cls._native_run_prefix()}run:{{{cls._safe_tag(run_id)}}}:leases"
+
+    @classmethod
+    def native_run_checkpoint_index(cls, run_id: str) -> str:
+        """Sorted checkpoint-version index co-located with a native run."""
+        return f"{cls._native_run_prefix()}run:{{{cls._safe_tag(run_id)}}}:checkpoints"
+
+    @classmethod
+    def native_run_checkpoint(cls, run_id: str, version: int) -> str:
+        """One immutable native-run checkpoint."""
+        return (
+            f"{cls._native_run_prefix()}run:{{{cls._safe_tag(run_id)}}}:"
+            f"checkpoint:{version}"
+        )
+
+    @classmethod
+    def native_run_remote_results(cls, run_id: str) -> str:
+        """Remote-agent interrupt/result hash co-located with a native run."""
+        return (
+            f"{cls._native_run_prefix()}run:{{{cls._safe_tag(run_id)}}}:remote_results"
+        )
+
+    @classmethod
+    def native_definition(cls, definition_hash: str) -> str:
+        """Immutable compiled definition keyed by its content hash."""
+        return (
+            f"{cls._native_run_prefix()}definition:{{{cls._safe_tag(definition_hash)}}}"
+        )
+
+    @classmethod
+    def _native_run_prefix(cls) -> str:
+        return (
+            cls.V2_PREFIX
+            if get_key_schema_version() == "v2"
+            else "byai_gateway:native:"
+        )
+
+    @staticmethod
+    def _safe_tag(value: str) -> str:
+        if not value or "{" in value or "}" in value:
+            raise ValueError("Redis hash-tag value must be non-empty without braces")
+        return value
+
+    @classmethod
     def _versioned(cls, v1_key: str, v2_suffix: str) -> str:
         """Resolve a key according to REDIS_KEY_SCHEMA_VERSION.
 
@@ -224,8 +286,7 @@ class RedisKeys:
         """Checkpoint key storing a consumer's last processed data stream ID."""
         return cls._versioned(
             v1_key=(
-                f"byai_gateway:session:{session_id}:consumer:"
-                f"{consumer_name}:checkpoint"
+                f"byai_gateway:session:{session_id}:consumer:{consumer_name}:checkpoint"
             ),
             v2_suffix=(f"session:{{{session_id}}}:consumer:{consumer_name}:checkpoint"),
         )

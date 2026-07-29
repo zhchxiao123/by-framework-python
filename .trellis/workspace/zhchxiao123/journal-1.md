@@ -60,3 +60,36 @@ Added an offline deterministic ReAct example using Agent, FunctionTool, Scripted
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: Unify native runtime context
+
+**Date**: 2026-07-28
+**Task**: Unify native runtime context
+**Package**: by-framework-history-postgres
+**Branch**: `main`
+
+### Summary
+
+Connected native Runner, graphs, Teams, and Worker hosting through a JSON-safe RunContext while preserving core.runtime session capabilities and existing history ownership.
+
+### Main Changes
+
+- Added RunIdentity, RunContext, local context resolution, and Worker capability adapter.
+- Added explicit ToolExecutionContext injection outside model-visible schemas.
+- Propagated session capabilities through native graphs and multi-agent child runs.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c53bc04` | (see git log) |
+
+### Testing
+
+- [OK] make test (all root and workspace package tests passed)
+- [OK] make lint (all workspace checks passed)
+
+### Status
+
+[OK] **Completed**

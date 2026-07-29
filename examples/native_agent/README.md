@@ -33,6 +33,23 @@ be imported. Construct or inject the HTTP/SDK transport in application code.
 This offline example intentionally does not copy a provider transport
 implementation or make a live request.
 
+## Run against a real OpenAI model
+
+The complete Chat Completions SSE transport is in
+`openai_weather_agent.py`. It reads credentials from the environment:
+
+```bash
+export OPENAI_API_KEY="your-api-key"
+export OPENAI_MODEL="gpt-5.6-terra"  # optional
+export OPENAI_BASE_URL="https://api.openai.com/v1"  # optional
+
+uv run python examples/native_agent/openai_weather_agent.py
+```
+
+`OPENAI_BASE_URL` can point at another OpenAI-compatible endpoint. The endpoint
+must implement streaming `POST /chat/completions` and OpenAI-compatible
+function calling. Tests use `httpx.MockTransport` and never make a live request.
+
 ## Runtime context
 
 Standalone runs create local session identity automatically. Applications can

@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from .model import ToolCall, ToolDeclaration, Usage
+from .runtime.context import RunContext, ToolExecutionContext
 
 
 class ToolError(RuntimeError):
@@ -73,6 +74,7 @@ class FunctionTool:
         aggregates_usage: bool = False,
     ):
         self.function = function
+        self.context_parameter = _context_parameter(function)
         self.spec = ToolSpec(
             name=name or function.__name__,
             description=description or inspect.getdoc(function) or "",
@@ -87,8 +89,14 @@ class FunctionTool:
 class ToolExecutor:
     """Executes registered function tools with signature validation."""
 
-    def __init__(self, tools: Mapping[str, FunctionTool]):
+    def __init__(
+        self,
+        tools: Mapping[str, FunctionTool],
+        *,
+        context: RunContext | None = None,
+    ):
         self._tools = dict(tools)
+        self._context = context
 
     async def execute(self, call: ToolCall) -> ToolResult:
         tool = self._tools.get(call.name)
@@ -102,7 +110,17 @@ class ToolExecutor:
             ) from exc
         try:
             signature = inspect.signature(tool.function)
-            bound = signature.bind(**call.arguments)
+            arguments = dict(call.arguments)
+            context_parameter = getattr(tool, "context_parameter", None)
+            if context_parameter is not None:
+                if self._context is None:
+                    raise ToolValidationError(
+                        f"tool {call.name!r} requires a runtime context"
+                    )
+                arguments[context_parameter] = ToolExecutionContext(
+                    self._context, call.id, call.name
+                )
+            bound = signature.bind(**arguments)
             bound.apply_defaults()
         except TypeError as exc:
             raise ToolValidationError(
@@ -148,6 +166,8 @@ def _function_schema(function: Callable[..., Any]) -> dict[str, Any]:
     properties: dict[str, Any] = {}
     required: list[str] = []
     for name, parameter in signature.parameters.items():
+        if hints.get(name, parameter.annotation) is ToolExecutionContext:
+            continue
         if parameter.kind in (
             inspect.Parameter.VAR_POSITIONAL,
             inspect.Parameter.VAR_KEYWORD,
@@ -172,6 +192,20 @@ def _function_schema(function: Callable[..., Any]) -> dict[str, Any]:
         "required": required,
         "additionalProperties": False,
     }
+
+
+def _context_parameter(function: Callable[..., Any]) -> str | None:
+    hints = get_type_hints(function)
+    names = [
+        name
+        for name, parameter in inspect.signature(function).parameters.items()
+        if hints.get(name, parameter.annotation) is ToolExecutionContext
+    ]
+    if len(names) > 1:
+        raise ToolValidationError(
+            f"tool {function.__name__!r} declares multiple execution contexts"
+        )
+    return names[0] if names else None
 
 
 def _return_schema(function: Callable[..., Any]) -> dict[str, Any]:

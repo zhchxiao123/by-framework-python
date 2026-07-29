@@ -9,6 +9,7 @@ from .deployment import (
     NativeCommandService,
     NativeStepWorker,
     StepExecutorRegistry,
+    worker_run_context,
 )
 from .compatibility import (
     AgentConfigAdapter,
@@ -74,6 +75,13 @@ from .observability import (
     NativeTraceContext,
     NativeTraceProjector,
 )
+from .runtime.context import (
+    RunContext,
+    RunContextError,
+    RunIdentity,
+    ToolExecutionContext,
+    local_run_context,
+)
 from .safety import (
     ApprovalAction,
     ApprovalController,
@@ -131,6 +139,9 @@ __all__ = [
     "RemoteAgentDispatcher",
     "RemoteAgentResult",
     "RunResult",
+    "RunContext",
+    "RunContextError",
+    "RunIdentity",
     "Runner",
     "ScriptedModel",
     "StreamEvent",
@@ -143,14 +154,17 @@ __all__ = [
     "ToolCall",
     "ToolCallCompleted",
     "ToolExecutor",
+    "ToolExecutionContext",
     "ToolMessage",
     "ToolResult",
     "ToolSpec",
     "TerminalStatus",
     "Usage",
+    "local_run_context",
     "UsageCompleted",
     "UserMessage",
     "WorkflowTeam",
+    "worker_run_context",
     "CompiledGraph",
     "Interrupt",
     "START",

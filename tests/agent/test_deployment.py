@@ -18,6 +18,7 @@ from by_framework.agent import (
     ScriptedModel,
     StateGraph,
     StepExecutorRegistry,
+    worker_run_context,
 )
 from by_framework.agent.runtime import RedisRemoteResultStore
 from by_framework.agent.runtime import RedisDefinitionStore
@@ -49,6 +50,37 @@ class Context:
 
     async def emit_chunk(self, content):
         self.chunks.append(content)
+
+
+class CapabilityContext(Context):
+    def __init__(self):
+        super().__init__()
+        self.history_writes = []
+        history = type(
+            "History",
+            (),
+            {"save_message": self._save_message},
+        )()
+        session = type(
+            "Session",
+            (),
+            {
+                "session_id": "session-1",
+                "user_code": "user-1",
+                "user_name": "User",
+                "private_file_manager": object(),
+                "shared_file_manager": object(),
+                "history": history,
+            },
+        )()
+        self.agent_runtime_state = type(
+            "RuntimeState",
+            (),
+            {"session_manager": session, "config_manager": object()},
+        )()
+
+    async def _save_message(self, *args, **kwargs):
+        self.history_writes.append((args, kwargs))
 
 
 def command(target: str, content: str, *, extra_payload=None):
@@ -88,6 +120,31 @@ def test_same_agent_and_plan_hash_run_embedded_and_server():
     served = asyncio.run(run_server())
     assert served.output == "server"
     assert served.plan_hash == plan_hash
+
+
+def test_worker_runtime_adapter_maps_capabilities_without_writing_history():
+    context = CapabilityContext()
+    request = command("echo", "hello")
+    adapted = worker_run_context(
+        context, request, run_id="run-1", agent_id="echo"
+    )
+    assert adapted.identity == adapted.identity.__class__(
+        "session-1",
+        "run-1",
+        "echo",
+        "user-1",
+        "User",
+        {
+            "trace_id": "trace-1",
+            "parent_message_id": "",
+            "trace_parent_span_id": "",
+            "langfuse_parent_observation_id": "",
+        },
+    )
+    assert adapted.private_files is not None
+    assert adapted.shared_files is not None
+    assert adapted.conversation is context.agent_runtime_state.session_manager.history
+    assert context.history_writes == []
 
 
 def test_catalog_persistence_and_executable_binding_are_immutable():

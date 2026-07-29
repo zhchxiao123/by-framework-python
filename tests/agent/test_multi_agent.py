@@ -9,6 +9,7 @@ from by_framework.agent import (
     AgentContextRemoteDispatcher,
     AgentTool,
     FakeModel,
+    FunctionTool,
     GraphRunner,
     Handoff,
     HandoffTeam,
@@ -16,11 +17,14 @@ from by_framework.agent import (
     ModelResponse,
     ParallelTeam,
     RemoteAgentResult,
+    RunContext,
+    RunIdentity,
     Runner,
     ScriptedModel,
     SupervisorTeam,
     ToolCall,
     ToolExecutor,
+    ToolExecutionContext,
     Usage,
     WorkflowTeam,
 )
@@ -320,3 +324,42 @@ def test_all_team_compilers_produce_stable_ordinary_graph_plans(build):
     assert first.plan.plan_hash == second.plan.plan_hash
     assert first.graph.plan is first.plan
     assert all(node.definition_hash for node in first.plan.nodes if node.id != "join")
+
+
+def test_team_propagates_session_capabilities_to_member_tools():
+    seen = {}
+
+    def inspect_context(context: ToolExecutionContext) -> str:
+        seen["session_id"] = context.run.identity.session_id
+        seen["agent_id"] = context.run.identity.agent_id
+        seen["files"] = context.run.private_files
+        return "observed"
+
+    member = Agent(
+        "member",
+        "Inspect context.",
+        ScriptedModel(
+            [
+                ModelResponse(
+                    "",
+                    (ToolCall("call-1", "inspect_context", {}),),
+                ),
+                ModelResponse("done"),
+            ]
+        ),
+        [FunctionTool(inspect_context)],
+    )
+    files = object()
+    context = RunContext(
+        RunIdentity("session-team", "run-team", "team"),
+        private_files=files,
+    )
+    result = asyncio.run(
+        ParallelTeam([member]).compile().run("work", context=context)
+    )
+    assert result.status == "completed"
+    assert seen == {
+        "session_id": "session-team",
+        "agent_id": "member",
+        "files": files,
+    }

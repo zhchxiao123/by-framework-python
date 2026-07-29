@@ -7,6 +7,13 @@ from .coordinator import (
     StepLease,
     StepResult,
 )
+from .context import (
+    RunContext,
+    RunContextError,
+    RunIdentity,
+    ToolExecutionContext,
+    local_run_context,
+)
 from .distributed import (
     DefinitionConflictError,
     LeaseConflictError,
@@ -31,6 +38,11 @@ from .store import (
 )
 
 __all__ = [
+    "RunContext",
+    "RunContextError",
+    "RunIdentity",
+    "ToolExecutionContext",
+    "local_run_context",
     "CommitConflictError",
     "CommitRequest",
     "CommitResult",

@@ -6,7 +6,12 @@ from typing import Any
 
 import pytest
 
-from by_framework.agent import FunctionTool, ToolCall, ToolExecutor
+from by_framework.agent import (
+    FunctionTool,
+    ToolCall,
+    ToolExecutionContext,
+    ToolExecutor,
+)
 from by_framework.agent.tools import ToolExecutionError, ToolValidationError
 
 
@@ -89,5 +94,19 @@ def test_tool_executor_validates_nested_collection_arguments():
         asyncio.run(
             executor.execute(
                 ToolCall("1", "summarize", {"items": [{"value": "wrong"}]})
+            )
+        )
+
+
+def test_context_aware_tool_requires_executor_context():
+    def contextual(context: ToolExecutionContext) -> str:
+        return context.run.identity.run_id
+
+    tool = FunctionTool(contextual)
+    assert tool.spec.input_schema["properties"] == {}
+    with pytest.raises(ToolValidationError, match="requires a runtime context"):
+        asyncio.run(
+            ToolExecutor({"contextual": tool}).execute(
+                ToolCall("call-1", "contextual", {})
             )
         )

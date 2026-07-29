@@ -32,3 +32,33 @@ structural typing for that transport boundary; no transport base class needs to
 be imported. Construct or inject the HTTP/SDK transport in application code.
 This offline example intentionally does not copy a provider transport
 implementation or make a live request.
+
+## Runtime context
+
+Standalone runs create local session identity automatically. Applications can
+pass an explicit context when tools need session capabilities:
+
+```python
+from by_framework.agent import RunContext, RunIdentity, Runner
+
+context = RunContext(
+    RunIdentity("session-1", "run-1", "weather-agent"),
+    private_files=my_private_file_manager,
+    shared_files=my_shared_file_manager,
+)
+result = await Runner().run(agent, "Weather?", context=context)
+```
+
+A tool opts into those capabilities with an injected parameter:
+
+```python
+from by_framework.agent import ToolExecutionContext
+
+async def read_note(path: str, context: ToolExecutionContext) -> dict:
+    files = context.run.require("private_files")
+    return await files.read_file(path)
+```
+
+The injected parameter is omitted from the model-visible tool schema.
+`NativeAgentWorker` builds the same context from its existing `AgentContext`,
+including session, user, trace, files, history, and configuration access.

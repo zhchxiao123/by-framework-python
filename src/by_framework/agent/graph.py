@@ -13,7 +13,8 @@ import time
 import types
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace as dataclass_replace
 from types import MappingProxyType
 from typing import (
     Any,
@@ -27,6 +28,7 @@ from typing import (
 )
 
 from .execution import Checkpoint, InMemoryCheckpointStore
+from .runtime.context import RunContext, RunContextError, local_run_context
 from .runtime.serialization import stable_plan_hash
 from .runtime.store import CommitRequest, InMemoryRunStore, RunEvent, RunStore
 
@@ -36,6 +38,9 @@ StateT = TypeVar("StateT", bound=Mapping[str, Any])
 Reducer = Callable[[Any, Any], Any]
 Node = Callable[[dict[str, Any]], Any]
 Router = Callable[[dict[str, Any]], str]
+_current_graph_context: ContextVar[RunContext | None] = ContextVar(
+    "native_graph_run_context", default=None
+)
 
 
 class GraphError(RuntimeError):
@@ -405,6 +410,7 @@ class GraphRunner:
         self._suspended: dict[str, _SuspendedRun] = {}
         self._cancelled: set[str] = set()
         self._plans: dict[str, CompiledGraph] = {}
+        self._contexts: dict[str, RunContext] = {}
 
     async def run(
         self,
@@ -412,9 +418,20 @@ class GraphRunner:
         initial_state: Mapping[str, Any],
         *,
         run_id: str | None = None,
+        context: RunContext | None = None,
     ) -> GraphRunResult:
         compiled = graph.compile() if isinstance(graph, StateGraph) else graph
-        resolved_id = run_id or f"run-{uuid.uuid4().hex}"
+        if context is None:
+            context = local_run_context(
+                compiled.plan.plan_hash, run_id=run_id
+            )
+        elif run_id is not None and run_id != context.identity.run_id:
+            raise RunContextError(
+                "run_id does not match runtime context identity"
+            )
+        context.projection()
+        resolved_id = context.identity.run_id
+        self._contexts[resolved_id] = context
         compiled.schema.validate(initial_state)
         self._plans[compiled.plan.plan_hash] = compiled
         frontier = _targets(compiled.plan.edges, START)
@@ -486,9 +503,24 @@ class GraphRunner:
         state = copy.deepcopy(checkpoint.state["graph_state"])
         frontier = tuple(checkpoint.state["frontier"])
         completed = set(checkpoint.state.get("completed", [START]))
+        resolved_new_id = new_run_id or f"run-{uuid.uuid4().hex}"
+        source_context = self._contexts.get(run_id)
+        self._contexts[resolved_new_id] = (
+            local_run_context(graph.plan.plan_hash, run_id=resolved_new_id)
+            if source_context is None
+            else RunContext(
+                dataclass_replace(
+                    source_context.identity, run_id=resolved_new_id
+                ),
+                source_context.private_files,
+                source_context.shared_files,
+                source_context.conversation,
+                source_context.agent_configs,
+            )
+        )
         return await self._drive(
             graph,
-            new_run_id or f"run-{uuid.uuid4().hex}",
+            resolved_new_id,
             state,
             frontier,
             version=0,
@@ -607,10 +639,17 @@ class GraphRunner:
                 return GraphRunResult(
                     run_id, state, "completed", version, graph.plan.plan_hash
                 )
-            results = await asyncio.gather(
-                *(self._execute_node(graph, node_id, state) for node_id in active),
-                return_exceptions=True,
-            )
+            context_token = _current_graph_context.set(self._contexts[run_id])
+            try:
+                results = await asyncio.gather(
+                    *(
+                        self._execute_node(graph, node_id, state)
+                        for node_id in active
+                    ),
+                    return_exceptions=True,
+                )
+            finally:
+                _current_graph_context.reset(context_token)
             writes: dict[str, Mapping[str, Any]] = {}
             transition_events: list[RunEvent] = []
             for node_id, result in zip(active, results):
@@ -769,7 +808,11 @@ class GraphRunner:
         last_error: BaseException | None = None
         for _ in range(policy.max_attempts):
             try:
-                invocation = _invoke(graph.nodes[node_id], copy.deepcopy(dict(state)))
+                invocation = _invoke(
+                    graph.nodes[node_id],
+                    copy.deepcopy(dict(state)),
+                    _current_graph_context.get(),
+                )
                 if policy.timeout_seconds is not None:
                     result = await asyncio.wait_for(
                         invocation, timeout=policy.timeout_seconds
@@ -891,6 +934,7 @@ class GraphRunner:
             "status": status,
             "steps": steps,
             "completed": sorted(completed),
+            "runtime_context": self._contexts[run_id].projection(),
         }
         result = await self.store.commit(
             CommitRequest(run_id, version, 1, events, durable_state)
@@ -901,8 +945,18 @@ class GraphRunner:
         return result.version
 
 
-async def _invoke(node: Node, state: dict[str, Any]) -> Any:
-    result = node(state)
+async def _invoke(
+    node: Node, state: dict[str, Any], context: RunContext | None = None
+) -> Any:
+    hints = get_type_hints(node)
+    context_parameters = [
+        name
+        for name, parameter in inspect.signature(node).parameters.items()
+        if hints.get(name, parameter.annotation) is RunContext
+    ]
+    if len(context_parameters) > 1:
+        raise GraphValidationError("graph node declares multiple run contexts")
+    result = node(state, context) if context_parameters else node(state)
     if inspect.isawaitable(result):
         return await result
     return result

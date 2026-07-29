@@ -17,6 +17,7 @@ from .definition import Agent, CompiledAgent
 from .execution import Runner
 from .graph import CompiledGraph, GraphRunResult, GraphRunner, StateGraph
 from .runtime.coordinator import StepLease, StepResult
+from .runtime.context import RunContext, RunIdentity
 from .runtime.distributed import (
     RedisCoordinatorStore,
     RedisDefinitionStore,
@@ -27,6 +28,50 @@ from .runtime.serialization import canonical_json, stable_plan_hash
 
 class DeploymentError(RuntimeError):
     """Native deployment composition error."""
+
+
+def worker_run_context(
+    context,
+    command: AskAgentCommand,
+    *,
+    run_id: str,
+    agent_id: str,
+) -> RunContext:
+    """Adapt an AgentContext without coupling the native runtime to Worker."""
+    runtime_state = getattr(context, "agent_runtime_state", None)
+    if runtime_state is None:
+        return RunContext(
+            RunIdentity(
+                command.header.session_id,
+                run_id,
+                agent_id,
+                command.header.user_code or "default",
+                command.header.user_name,
+                {"trace_id": command.header.trace_id},
+            )
+        )
+    session = runtime_state.session_manager
+    return RunContext(
+        RunIdentity(
+            session.session_id,
+            run_id,
+            agent_id,
+            session.user_code or "default",
+            session.user_name or "",
+            {
+                "trace_id": command.header.trace_id,
+                "parent_message_id": command.header.parent_message_id,
+                "trace_parent_span_id": command.header.trace_parent_span_id,
+                "langfuse_parent_observation_id": (
+                    command.header.langfuse_parent_observation_id
+                ),
+            },
+        ),
+        private_files=session.private_file_manager,
+        shared_files=session.shared_file_manager,
+        conversation=session.history,
+        agent_configs=runtime_state.config_manager,
+    )
 
 
 @dataclass(frozen=True)
@@ -117,10 +162,15 @@ class NativeAgentWorker(GatewayWorker):
         content = command.content
         if not isinstance(content, str):
             raise DeploymentError("native Agent input must be text")
+        run_id = f"run-{command.header.session_id}-{command.header.message_id}"
+        run_context = worker_run_context(
+            context, command, run_id=run_id, agent_id=agent.spec.name
+        )
         stream = self.runner.run_streamed(
             agent,
             content,
-            run_id=(f"run-{command.header.session_id}-{command.header.message_id}"),
+            run_id=run_id,
+            context=run_context,
         )
         async for event in stream:
             if event.kind == "text_delta":

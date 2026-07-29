@@ -4,7 +4,6 @@ import asyncio
 import copy
 import json
 import time
-import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +24,7 @@ from .model import (
     UserMessage,
 )
 from .runtime.coordinator import CoordinatorLeaseManager
+from .runtime.context import RunContext, resolve_run_context
 from .runtime.serialization import canonical_json
 from .runtime.store import CommitRequest, InMemoryRunStore, RunEvent, RunStore
 from .safety import (
@@ -138,13 +138,16 @@ class LocalCoordinator:
         self._approvals: dict[str, _ApprovalSuspension] = {}
         self._decisions: dict[str, ApprovalDecision] = {}
         self._decision_results: dict[str, RunResult] = {}
+        self._contexts: dict[str, RunContext] = {}
 
     async def run(
         self,
         compiled: CompiledAgent,
         user_input: str,
         run_id: str,
+        context: RunContext,
     ) -> AsyncIterator[StreamEvent]:
+        self._contexts[run_id] = context
         leases = CoordinatorLeaseManager(time.monotonic)
         coordinator = leases.acquire(f"local:{run_id}", ttl_seconds=3600)
         if coordinator is None:  # pragma: no cover - new manager is always free
@@ -189,7 +192,10 @@ class LocalCoordinator:
         *,
         start_turn: int,
     ) -> AsyncIterator[StreamEvent]:
-        executor = ToolExecutor({tool.spec.name: tool for tool in compiled.tools})
+        executor = ToolExecutor(
+            {tool.spec.name: tool for tool in compiled.tools},
+            context=self._contexts.get(run_id),
+        )
         specs = {tool.spec.name: tool.spec for tool in compiled.tools}
         output = ""
         for turn in range(start_turn, self._max_model_turns + 1):
@@ -524,7 +530,8 @@ class LocalCoordinator:
             yield StreamEvent("run_completed", {"result": result})
             return
         executor = ToolExecutor(
-            {tool.spec.name: tool for tool in suspension.compiled.tools}
+            {tool.spec.name: tool for tool in suspension.compiled.tools},
+            context=self._contexts.get(suspension.run_id),
         )
         try:
             tool_result = await executor.execute(approved_call)
@@ -783,6 +790,7 @@ class LocalCoordinator:
         state = {
             "messages": messages,
             "usage": usage,
+            "runtime_context": self._contexts[run_id].projection(),
         }
         if approval_state is not None:
             state["pending_approval"] = approval_state
@@ -825,8 +833,11 @@ class Runner:
         user_input: str,
         *,
         run_id: str | None = None,
+        context: RunContext | None = None,
     ) -> RunResult:
-        stream = self.run_streamed(agent, user_input, run_id=run_id)
+        stream = self.run_streamed(
+            agent, user_input, run_id=run_id, context=context
+        )
         async for _ in stream:
             pass
         return await stream.result()
@@ -837,9 +848,13 @@ class Runner:
         user_input: str,
         *,
         run_id: str | None = None,
+        context: RunContext | None = None,
     ) -> RunStream:
         compiled = agent.compile() if isinstance(agent, Agent) else agent
-        resolved_run_id = run_id or f"run-{uuid.uuid4().hex}"
+        resolved_context = resolve_run_context(
+            compiled.spec.name, run_id, context
+        )
+        resolved_run_id = resolved_context.identity.run_id
         loop = asyncio.get_running_loop()
         result_future = loop.create_future()
         # Iteration itself raises run errors. Mark the mirrored result future as
@@ -852,7 +867,7 @@ class Runner:
         async def events():
             try:
                 async for event in self._coordinator.run(
-                    compiled, user_input, resolved_run_id
+                    compiled, user_input, resolved_run_id, resolved_context
                 ):
                     if event.kind in ("run_completed", "run_interrupted"):
                         result_future.set_result(event.data["result"])

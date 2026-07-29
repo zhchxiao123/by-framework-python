@@ -19,6 +19,7 @@ from .graph import (
 )
 from .model import Usage
 from .runtime.serialization import stable_plan_hash
+from .runtime.context import RunContext, RunIdentity
 from .tools import FunctionTool
 
 
@@ -239,12 +240,14 @@ class CompiledTeam:
         run_id: str | None = None,
         trace_context: Mapping[str, Any] | None = None,
         graph_runner: GraphRunner | None = None,
+        context: RunContext | None = None,
     ) -> GraphRunResult:
         runner = graph_runner or GraphRunner(max_steps=self.max_steps)
         return await runner.run(
             self.graph,
             _initial_state(user_input, trace_context),
             run_id=run_id,
+            context=context,
         )
 
 
@@ -461,19 +464,25 @@ def _compile_agent(agent: Agent | CompiledAgent) -> CompiledAgent:
 def _member_node(
     agent: CompiledAgent, max_model_turns: int, *, use_previous: bool = False
 ):
-    async def invoke(state: TeamState) -> dict[str, Any]:
+    async def invoke(
+        state: TeamState, context: RunContext
+    ) -> dict[str, Any]:
         prompt = state["output"] if use_previous and state["output"] else state["input"]
-        result = await Runner(max_model_turns=max_model_turns).run(agent, prompt)
+        result = await Runner(max_model_turns=max_model_turns).run(
+            agent, prompt, context=_child_context(context, agent.spec.name)
+        )
         return _agent_writes(agent.spec.name, result.output, result.usage)
 
     return invoke
 
 
 def _supervisor_select_node(agent: CompiledAgent, max_model_turns: int):
-    async def select(state: TeamState) -> dict[str, Any]:
+    async def select(state: TeamState, context: RunContext) -> dict[str, Any]:
         user_input = state["input"]
         result = await Runner(max_model_turns=max_model_turns).run(
-            agent, f"Select one member for: {user_input}"
+            agent,
+            f"Select one member for: {user_input}",
+            context=_child_context(context, agent.spec.name),
         )
         return {
             "active_agent": result.output.strip(),
@@ -485,9 +494,13 @@ def _supervisor_select_node(agent: CompiledAgent, max_model_turns: int):
 
 
 def _synthesis_node(agent: CompiledAgent, max_model_turns: int):
-    async def synthesize(state: TeamState) -> dict[str, Any]:
+    async def synthesize(
+        state: TeamState, context: RunContext
+    ) -> dict[str, Any]:
         prompt = json.dumps(state["results"], ensure_ascii=False, sort_keys=True)
-        result = await Runner(max_model_turns=max_model_turns).run(agent, prompt)
+        result = await Runner(max_model_turns=max_model_turns).run(
+            agent, prompt, context=_child_context(context, agent.spec.name)
+        )
         return {
             "output": result.output,
             "usage": _usage_dict(result.usage),
@@ -502,9 +515,11 @@ def _join_node(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handoff_source_node(agent: CompiledAgent, max_model_turns: int):
-    async def source(state: TeamState) -> dict[str, Any]:
+    async def source(state: TeamState, context: RunContext) -> dict[str, Any]:
         result = await Runner(max_model_turns=max_model_turns).run(
-            agent, state["input"]
+            agent,
+            state["input"],
+            context=_child_context(context, agent.spec.name),
         )
         prefix, _, payload = result.output.partition(":")
         if prefix == "handoff" and ":" in payload:
@@ -526,17 +541,38 @@ def _handoff_source_node(agent: CompiledAgent, max_model_turns: int):
 
 
 def _handoff_target_node(handoff: Handoff, agent: CompiledAgent, max_model_turns: int):
-    async def target(state: TeamState) -> dict[str, Any] | Interrupt:
+    async def target(
+        state: TeamState, context: RunContext
+    ) -> dict[str, Any] | Interrupt:
         prepared = handoff.prepare(state["input"], state["history"])
         if isinstance(prepared, Interrupt):
             return prepared
         prompt, history = prepared
         result = await Runner(max_model_turns=max_model_turns).run(
-            agent, "\n".join((*history, prompt))
+            agent,
+            "\n".join((*history, prompt)),
+            context=_child_context(context, agent.spec.name),
         )
         return _agent_writes(agent.spec.name, result.output, result.usage)
 
     return target
+
+
+def _child_context(parent: RunContext, agent_id: str) -> RunContext:
+    return RunContext(
+        RunIdentity(
+            parent.identity.session_id,
+            f"run-{uuid.uuid4().hex}",
+            agent_id,
+            parent.identity.user_code,
+            parent.identity.user_name,
+            parent.identity.trace_context,
+        ),
+        parent.private_files,
+        parent.shared_files,
+        parent.conversation,
+        parent.agent_configs,
+    )
 
 
 def _agent_writes(name: str, output: str, usage: Usage) -> dict[str, Any]:

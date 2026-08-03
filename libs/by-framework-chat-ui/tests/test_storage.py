@@ -107,15 +107,35 @@ async def test_get_conversation_returns_agent_type_and_title():
 async def test_get_messages_returns_rows_in_order():
     store, conn = _make_store()
     conn.fetch.return_value = [
-        {"role": "user", "content": "hi", "is_ask_user": False},
-        {"role": "assistant", "content": "hello", "is_ask_user": False},
+        {
+            "role": "user",
+            "content": "hi",
+            "is_ask_user": False,
+            "created_at": "2026-08-03T10:24:00+00:00",
+        },
+        {
+            "role": "assistant",
+            "content": "hello",
+            "is_ask_user": False,
+            "created_at": "2026-08-03T10:24:05+00:00",
+        },
     ]
 
     result = await store.get_messages("s1")
 
     assert result == [
-        {"role": "user", "content": "hi", "is_ask_user": False},
-        {"role": "assistant", "content": "hello", "is_ask_user": False},
+        {
+            "role": "user",
+            "content": "hi",
+            "is_ask_user": False,
+            "created_at": "2026-08-03T10:24:00+00:00",
+        },
+        {
+            "role": "assistant",
+            "content": "hello",
+            "is_ask_user": False,
+            "created_at": "2026-08-03T10:24:05+00:00",
+        },
     ]
 
 

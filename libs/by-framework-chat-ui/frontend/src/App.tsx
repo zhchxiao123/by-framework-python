@@ -39,10 +39,10 @@ function Chat({ conversation }: { conversation: OpenConversation }) {
 
   return (
     <div className="flex h-full flex-1 flex-col">
-      <div className="border-b border-slate-200 bg-white px-6 py-4">
+      <div className="flex items-center border-b border-slate-200 bg-white px-6 py-4 dark:border-slate-800 dark:bg-slate-900">
         <p className="text-sm">
-          <span className="font-semibold text-slate-800">助手:</span>{" "}
-          <span className="text-slate-600">{conversation.agentType}</span>
+          <span className="font-semibold text-slate-800 dark:text-slate-100">助手:</span>{" "}
+          <span className="text-slate-600 dark:text-slate-400">{conversation.agentType}</span>
         </p>
       </div>
       <AssistantRuntimeProvider runtime={runtime}>
@@ -93,7 +93,7 @@ export function App() {
   }
 
   return (
-    <div className="flex h-screen w-screen bg-slate-50">
+    <div className="flex h-screen w-screen bg-slate-50 dark:bg-slate-900">
       <Sidebar
         selectedSessionId={conversation?.sessionId ?? null}
         onSelect={openConversation}

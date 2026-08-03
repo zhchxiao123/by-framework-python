@@ -85,7 +85,7 @@ class ChatHistoryStore:
     """
 
     _SELECT_MESSAGES_SQL = """
-    SELECT role, content, is_ask_user
+    SELECT role, content, is_ask_user, created_at
     FROM chat_ui_messages
     WHERE session_id = $1
     ORDER BY created_at, id;
@@ -231,6 +231,7 @@ class ChatHistoryStore:
                 "role": r["role"],
                 "content": r["content"],
                 "is_ask_user": r["is_ask_user"],
+                "created_at": _isoformat(r["created_at"]),
             }
             for r in rows
         ]

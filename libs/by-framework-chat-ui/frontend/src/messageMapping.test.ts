@@ -4,7 +4,12 @@ import type { HistoryMessage } from "./api";
 
 describe("historyMessageToThreadMessage", () => {
   it("maps a user message", () => {
-    const record: HistoryMessage = { role: "user", content: "hi", is_ask_user: false };
+    const record: HistoryMessage = {
+      role: "user",
+      content: "hi",
+      is_ask_user: false,
+      created_at: "2026-08-03T09:05:00+00:00",
+    };
 
     const message = historyMessageToThreadMessage(record, 0);
 
@@ -17,6 +22,7 @@ describe("historyMessageToThreadMessage", () => {
       role: "assistant",
       content: "hello there",
       is_ask_user: false,
+      created_at: "2026-08-03T09:05:00+00:00",
     };
 
     const message = historyMessageToThreadMessage(record, 1);
@@ -32,6 +38,7 @@ describe("historyMessageToThreadMessage", () => {
       role: "assistant",
       content: "What is your name?",
       is_ask_user: true,
+      created_at: "2026-08-03T09:05:00+00:00",
     };
 
     const message = historyMessageToThreadMessage(record, 1);
@@ -43,14 +50,27 @@ describe("historyMessageToThreadMessage", () => {
 
   it("assigns each message a unique, stable id derived from its index", () => {
     const a = historyMessageToThreadMessage(
-      { role: "user", content: "a", is_ask_user: false },
+      { role: "user", content: "a", is_ask_user: false, created_at: "2026-08-03T09:05:00+00:00" },
       0,
     );
     const b = historyMessageToThreadMessage(
-      { role: "user", content: "b", is_ask_user: false },
+      { role: "user", content: "b", is_ask_user: false, created_at: "2026-08-03T09:05:00+00:00" },
       1,
     );
 
     expect(a.id).not.toBe(b.id);
+  });
+
+  it("parses the persisted created_at into the message's createdAt", () => {
+    const record: HistoryMessage = {
+      role: "user",
+      content: "hi",
+      is_ask_user: false,
+      created_at: "2026-08-03T09:05:00+00:00",
+    };
+
+    const message = historyMessageToThreadMessage(record, 0);
+
+    expect(message.createdAt).toEqual(new Date("2026-08-03T09:05:00+00:00"));
   });
 });

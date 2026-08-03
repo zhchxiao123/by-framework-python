@@ -20,18 +20,20 @@ export function AssistantPicker({
 
   return (
     <div className="flex h-full flex-col items-center justify-center gap-4 px-6">
-      <h1 className="text-lg font-semibold text-slate-800">选择一个助手开始对话</h1>
+      <h1 className="text-lg font-semibold text-slate-800 dark:text-slate-100">选择一个助手开始对话</h1>
       <div className="flex w-full max-w-sm flex-col gap-2">
-        {agentTypes === null && <p className="text-sm text-slate-400">加载中…</p>}
+        {agentTypes === null && (
+          <p className="text-sm text-slate-400 dark:text-slate-500">加载中…</p>
+        )}
         {agentTypes?.length === 0 && (
-          <p className="text-sm text-slate-400">当前没有在线的助手</p>
+          <p className="text-sm text-slate-400 dark:text-slate-500">当前没有在线的助手</p>
         )}
         {agentTypes?.map((agentType) => (
           <button
             key={agentType}
             type="button"
             onClick={() => onPick(agentType)}
-            className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-left text-sm font-medium text-slate-700 shadow-sm hover:border-brand-500 hover:text-brand-600"
+            className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-left text-sm font-medium text-slate-700 shadow-sm hover:border-brand-500 hover:text-brand-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300"
           >
             {agentType}
           </button>

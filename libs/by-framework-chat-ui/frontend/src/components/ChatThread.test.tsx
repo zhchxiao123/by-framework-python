@@ -18,13 +18,31 @@ function Fixture({
   const socket = createSessionSocket("s1", () => new FakeSocket() as unknown as WebSocket);
   const adapter = createWebSocketChatAdapter(socket);
   const initialMessages = [
-    historyMessageToThreadMessage({ role: "user", content: "你好", is_ask_user: false }, 0),
     historyMessageToThreadMessage(
-      { role: "assistant", content: "好的,请问查询哪个城市?", is_ask_user: false },
+      {
+        role: "user",
+        content: "你好",
+        is_ask_user: false,
+        created_at: "2026-08-03T09:05:00+00:00",
+      },
+      0,
+    ),
+    historyMessageToThreadMessage(
+      {
+        role: "assistant",
+        content: "好的,请问查询哪个城市?",
+        is_ask_user: false,
+        created_at: "2026-08-03T09:06:00+00:00",
+      },
       1,
     ),
     historyMessageToThreadMessage(
-      { role: "assistant", content: "可以告诉我你的名字吗?", is_ask_user: true },
+      {
+        role: "assistant",
+        content: "可以告诉我你的名字吗?",
+        is_ask_user: true,
+        created_at: "2026-08-03T09:07:00+00:00",
+      },
       2,
     ),
   ];

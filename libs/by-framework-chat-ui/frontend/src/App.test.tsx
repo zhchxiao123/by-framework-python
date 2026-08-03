@@ -70,7 +70,14 @@ describe("App: reopening a past conversation", () => {
             JSON.stringify({
               session_id: "s1",
               agent_type: "planner",
-              messages: [{ role: "user", content: "你好", is_ask_user: false }],
+              messages: [
+                {
+                  role: "user",
+                  content: "你好",
+                  is_ask_user: false,
+                  created_at: "2026-08-03T09:05:00+00:00",
+                },
+              ],
             }),
             { status: 200 },
           );
@@ -80,7 +87,14 @@ describe("App: reopening a past conversation", () => {
             JSON.stringify({
               session_id: "s2",
               agent_type: "demo-assistant",
-              messages: [{ role: "user", content: "帮我整理一下", is_ask_user: false }],
+              messages: [
+                {
+                  role: "user",
+                  content: "帮我整理一下",
+                  is_ask_user: false,
+                  created_at: "2026-08-03T09:05:00+00:00",
+                },
+              ],
             }),
             { status: 200 },
           );

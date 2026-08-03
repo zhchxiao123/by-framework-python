@@ -14,7 +14,7 @@ export function historyMessageToThreadMessage(
   index: number,
 ): ThreadMessage {
   const id = `history-${index}`;
-  const createdAt = new Date();
+  const createdAt = new Date(record.created_at);
   const content = [{ type: "text" as const, text: record.content }];
 
   if (record.role === "user") {

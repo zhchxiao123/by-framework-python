@@ -9,6 +9,7 @@ export interface HistoryMessage {
   role: string;
   content: string;
   is_ask_user: boolean;
+  created_at: string;
 }
 
 export interface ConversationDetail {

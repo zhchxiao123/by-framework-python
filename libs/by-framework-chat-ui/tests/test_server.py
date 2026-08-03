@@ -277,8 +277,18 @@ async def test_get_conversation_returns_persisted_history():
         session_id = (await create_resp.json())["session_id"]
 
         conn.fetch.return_value = [
-            {"role": "user", "content": "hi", "is_ask_user": False},
-            {"role": "assistant", "content": "hello", "is_ask_user": False},
+            {
+                "role": "user",
+                "content": "hi",
+                "is_ask_user": False,
+                "created_at": "2026-08-03T10:24:00+00:00",
+            },
+            {
+                "role": "assistant",
+                "content": "hello",
+                "is_ask_user": False,
+                "created_at": "2026-08-03T10:24:05+00:00",
+            },
         ]
 
         resp = await tc.get(f"/api/conversations/{session_id}")
@@ -288,8 +298,18 @@ async def test_get_conversation_returns_persisted_history():
     assert body["session_id"] == session_id
     assert body["agent_type"] == "planner"
     assert body["messages"] == [
-        {"role": "user", "content": "hi", "is_ask_user": False},
-        {"role": "assistant", "content": "hello", "is_ask_user": False},
+        {
+            "role": "user",
+            "content": "hi",
+            "is_ask_user": False,
+            "created_at": "2026-08-03T10:24:00+00:00",
+        },
+        {
+            "role": "assistant",
+            "content": "hello",
+            "is_ask_user": False,
+            "created_at": "2026-08-03T10:24:05+00:00",
+        },
     ]
 
 
@@ -306,7 +326,14 @@ async def test_get_conversation_rehydrates_from_postgres_after_restart():
         "title": "Hello",
         "turn_state": "IDLE",
     }
-    conn.fetch.return_value = [{"role": "user", "content": "hi", "is_ask_user": False}]
+    conn.fetch.return_value = [
+        {
+            "role": "user",
+            "content": "hi",
+            "is_ask_user": False,
+            "created_at": "2026-08-03T10:24:00+00:00",
+        }
+    ]
     app = create_app(
         gateway_client=client, registry=registry, history_store=history_store
     )
@@ -319,7 +346,14 @@ async def test_get_conversation_rehydrates_from_postgres_after_restart():
     assert body == {
         "session_id": "old-session",
         "agent_type": "planner",
-        "messages": [{"role": "user", "content": "hi", "is_ask_user": False}],
+        "messages": [
+            {
+                "role": "user",
+                "content": "hi",
+                "is_ask_user": False,
+                "created_at": "2026-08-03T10:24:00+00:00",
+            }
+        ],
     }
 
 

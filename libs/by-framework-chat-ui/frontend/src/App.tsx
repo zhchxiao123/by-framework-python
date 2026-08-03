@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { AssistantRuntimeProvider, useLocalRuntime, type ThreadMessage } from "@assistant-ui/react";
 import { AssistantPicker } from "./components/AssistantPicker";
+import { Avatar } from "./components/Avatar";
 import { ChatThread } from "./components/ChatThread";
 import { ErrorNotice } from "./components/ErrorNotice";
 import { Sidebar } from "./components/Sidebar";
@@ -38,12 +39,19 @@ function Chat({ conversation }: { conversation: OpenConversation }) {
   const connectionStatus = useConnectionStatus(socket);
 
   return (
-    <div className="flex h-full flex-1 flex-col">
-      <div className="flex items-center border-b border-slate-200 bg-white px-6 py-4 dark:border-slate-800 dark:bg-slate-900">
-        <p className="text-sm">
-          <span className="font-semibold text-slate-800 dark:text-slate-100">助手:</span>{" "}
-          <span className="text-slate-600 dark:text-slate-400">{conversation.agentType}</span>
-        </p>
+    <div className="mx-auto flex h-full w-full max-w-3xl min-w-0 flex-1 flex-col">
+      <div className="flex items-center gap-2 border-b border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-900">
+        <Avatar role="assistant" />
+        <div>
+          <p className="text-sm font-semibold text-slate-800 dark:text-slate-100">
+            <span>{conversation.agentType}</span>{" "}
+            <span className="font-normal text-slate-500 dark:text-slate-400">助手</span>
+          </p>
+          <p className="flex items-center gap-1 text-xs text-slate-400 dark:text-slate-500">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" aria-hidden />
+            在线
+          </p>
+        </div>
       </div>
       <AssistantRuntimeProvider runtime={runtime}>
         <ChatThread locked={locked} connectionStatus={connectionStatus} />
@@ -100,7 +108,7 @@ export function App() {
         onNewConversation={goToPicker}
         refreshKey={sidebarRefreshKey}
       />
-      <div className="flex flex-1 flex-col">
+      <div className="flex min-w-0 flex-1 flex-col">
         {error !== null && (
           <div className="p-4">
             <ErrorNotice message={error} />

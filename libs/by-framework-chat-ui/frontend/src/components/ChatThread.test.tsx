@@ -55,6 +55,29 @@ function Fixture({
   );
 }
 
+function MarkdownFixture() {
+  const socket = createSessionSocket("s1", () => new FakeSocket() as unknown as WebSocket);
+  const adapter = createWebSocketChatAdapter(socket);
+  const initialMessages = [
+    historyMessageToThreadMessage(
+      {
+        role: "assistant",
+        content: "**加粗文本**\n\n- 第一项\n- 第二项\n\n`inline code`",
+        is_ask_user: false,
+        created_at: "2026-08-03T09:06:00+00:00",
+      },
+      0,
+    ),
+  ];
+  const runtime = useLocalRuntime(adapter, { initialMessages });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <ChatThread locked={false} />
+    </AssistantRuntimeProvider>
+  );
+}
+
 function ErrorFixture({ socket }: { socket: ReturnType<typeof createSessionSocket> }) {
   const adapter = createWebSocketChatAdapter(socket);
   const runtime = useLocalRuntime(adapter);
@@ -101,6 +124,17 @@ describe("ChatThread connection status", () => {
 
     rerender(<Fixture connectionStatus="reconnecting" />);
     expect(screen.getByText("重新连接中…")).toBeInTheDocument();
+  });
+});
+
+describe("ChatThread markdown rendering", () => {
+  it("renders assistant markdown as real elements, not literal syntax", () => {
+    const { container } = render(<MarkdownFixture />);
+
+    expect(screen.getByText("加粗文本").tagName).toBe("STRONG");
+    expect(container.querySelectorAll("li")).toHaveLength(2);
+    expect(screen.getByText("inline code").tagName).toBe("CODE");
+    expect(screen.queryByText(/\*\*加粗文本\*\*/)).not.toBeInTheDocument();
   });
 });
 

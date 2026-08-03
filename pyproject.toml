@@ -54,6 +54,7 @@ members = [
     "libs/by-framework-trace-query",
     "libs/by-framework-dashboard",
     "libs/by-framework-adk",
+    "libs/by-framework-chat-ui",
 ]
 
 [tool.uv.sources]

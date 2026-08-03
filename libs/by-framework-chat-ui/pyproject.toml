@@ -1,0 +1,39 @@
+[project]
+name = "by-framework-chat-ui"
+version = "0.0.1.dev0"
+description = "End-user chat interface for by-framework"
+requires-python = ">=3.12"
+dependencies = [
+    "by-framework>=0.2.1",
+    "aiohttp>=3.9.0",
+    "asyncpg>=0.29.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "websockets>=12.0",
+    "isort>=5.13.0",
+    "pyink>=24.0.0",
+    "pylint>=3.0.0",
+    "ruff>=0.3.0",
+]
+
+[project.scripts]
+by-framework-chat-ui = "by_framework_chat_ui.server:main"
+
+[tool.uv.sources]
+by-framework = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/by_framework_chat_ui"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../../src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"

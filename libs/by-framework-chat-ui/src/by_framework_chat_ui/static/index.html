@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>by-framework Chat</title>
+<style>
+  body { font-family: sans-serif; max-width: 900px; margin: 2rem auto; display: flex; gap: 1.5rem; }
+  #sidebar { width: 220px; flex: none; }
+  #conversation-list { list-style: none; padding: 0; margin: 0; }
+  #conversation-list li button { width: 100%; text-align: left; padding: 0.4rem; margin-bottom: 0.25rem; }
+  #main { flex: auto; }
+  #picker, #chat { display: none; }
+  #picker.active, #chat.active { display: block; }
+  #messages { border: 1px solid #ccc; min-height: 300px; padding: 0.5rem; overflow-y: auto; }
+  .msg { margin: 0.5rem 0; }
+  .msg.user { text-align: right; color: #333; }
+  .msg.assistant { text-align: left; color: #06c; }
+  .msg.ask-user { border-left: 3px solid #e67e22; padding-left: 0.5rem; }
+  .msg.ask-user .badge { font-size: 0.75rem; color: #e67e22; display: block; }
+  .msg.error { color: #c0392b; }
+  #locked-banner { display: none; color: #888; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+  <div id="sidebar">
+    <h2>历史对话</h2>
+    <button id="new-conversation-button" type="button">+ 新对话</button>
+    <ul id="conversation-list"></ul>
+  </div>
+
+  <div id="main">
+    <div id="picker" class="active">
+      <h1>选择一个助手开始对话</h1>
+      <ul id="agent-list"></ul>
+    </div>
+
+    <div id="chat">
+      <p><strong>助手:</strong> <span id="agent-name"></span></p>
+      <div id="locked-banner">请等待当前回复完成…</div>
+      <div id="messages"></div>
+      <form id="send-form">
+        <input id="content" type="text" placeholder="输入消息…" autocomplete="off" style="width: 80%">
+        <button type="submit">发送</button>
+      </form>
+    </div>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  var pickerEl = document.getElementById("picker");
+  var chatEl = document.getElementById("chat");
+  var agentListEl = document.getElementById("agent-list");
+  var agentNameEl = document.getElementById("agent-name");
+  var messagesEl = document.getElementById("messages");
+  var sendFormEl = document.getElementById("send-form");
+  var contentEl = document.getElementById("content");
+  var lockedBannerEl = document.getElementById("locked-banner");
+  var conversationListEl = document.getElementById("conversation-list");
+  var newConversationButtonEl = document.getElementById("new-conversation-button");
+
+  var ws = null;
+  var reconnectDelayMs = 500;
+  var sessionId = null;
+  var assistantBubble = null;
+
+  function appendMessage(role, text, extraClass) {
+    var div = document.createElement("div");
+    div.className = "msg " + role + (extraClass ? " " + extraClass : "");
+    if (extraClass === "ask-user") {
+      var badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "需要你回复";
+      div.appendChild(badge);
+    }
+    var textNode = document.createElement("span");
+    textNode.textContent = text;
+    div.appendChild(textNode);
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return textNode;
+  }
+
+  function setLocked(locked) {
+    lockedBannerEl.style.display = locked ? "block" : "none";
+    contentEl.disabled = locked;
+  }
+
+  function connect() {
+    var protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(protocol + "//" + window.location.host + "/ws/conversations/" + sessionId);
+
+    ws.onopen = function () {
+      reconnectDelayMs = 500;
+    };
+
+    ws.onmessage = function (event) {
+      var msg = JSON.parse(event.data);
+      if (msg.type === "chunk") {
+        if (!assistantBubble) {
+          assistantBubble = appendMessage("assistant", "");
+        }
+        assistantBubble.textContent += msg.content;
+      } else if (msg.type === "final") {
+        if (!assistantBubble) {
+          assistantBubble = appendMessage("assistant", "");
+        }
+        assistantBubble.textContent = msg.content;
+      } else if (msg.type === "ask_user") {
+        appendMessage("assistant", msg.prompt, "ask-user");
+        assistantBubble = null;
+        setLocked(false);
+      } else if (msg.type === "turn_complete") {
+        assistantBubble = null;
+        setLocked(false);
+      } else if (msg.type === "error") {
+        appendMessage("error", msg.message, "error");
+        assistantBubble = null;
+        setLocked(false);
+      } else if (msg.type === "locked") {
+        setLocked(true);
+      } else if (msg.type === "unlocked") {
+        // Broadcast to every viewer of this Conversation, not just the
+        // sender — a passive second tab needs this to clear its own
+        // locked banner too, since it never receives turn_complete/ask_user
+        // for a turn it didn't send.
+        setLocked(false);
+      }
+    };
+
+    ws.onclose = function () {
+      // A dropped connection reconnects on its own with a short backoff so a
+      // brief network hiccup doesn't force a manual page reload.
+      setTimeout(connect, reconnectDelayMs);
+      reconnectDelayMs = Math.min(reconnectDelayMs * 2, 8000);
+    };
+  }
+
+  function loadAgents() {
+    fetch("/api/agents").then(function (resp) { return resp.json(); }).then(function (body) {
+      agentListEl.innerHTML = "";
+      body.agent_types.forEach(function (agentType) {
+        var li = document.createElement("li");
+        var button = document.createElement("button");
+        button.textContent = agentType;
+        button.onclick = function () { startConversation(agentType); };
+        li.appendChild(button);
+        agentListEl.appendChild(li);
+      });
+    });
+  }
+
+  function openChat(newSessionId, agentType) {
+    sessionId = newSessionId;
+    agentNameEl.textContent = agentType;
+    pickerEl.classList.remove("active");
+    chatEl.classList.add("active");
+    messagesEl.innerHTML = "";
+    assistantBubble = null;
+    connect();
+  }
+
+  function startConversation(agentType) {
+    fetch("/api/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_type: agentType })
+    }).then(function (resp) { return resp.json(); }).then(function (body) {
+      openChat(body.session_id, body.agent_type);
+      loadConversationList();
+    });
+  }
+
+  function openConversation(id) {
+    fetch("/api/conversations/" + id).then(function (resp) { return resp.json(); }).then(function (body) {
+      openChat(body.session_id, body.agent_type);
+      body.messages.forEach(function (message) {
+        appendMessage(message.role, message.content, message.is_ask_user ? "ask-user" : undefined);
+      });
+    });
+  }
+
+  function loadConversationList() {
+    fetch("/api/conversations").then(function (resp) { return resp.json(); }).then(function (body) {
+      conversationListEl.innerHTML = "";
+      body.conversations.forEach(function (conversation) {
+        var li = document.createElement("li");
+        var button = document.createElement("button");
+        button.textContent = (conversation.title || "(新对话)") + " · " + conversation.agent_type;
+        button.onclick = function () { openConversation(conversation.session_id); };
+        li.appendChild(button);
+        conversationListEl.appendChild(li);
+      });
+    });
+  }
+
+  newConversationButtonEl.addEventListener("click", function () {
+    if (ws) {
+      ws.onclose = null;
+      ws.close();
+      ws = null;
+    }
+    chatEl.classList.remove("active");
+    pickerEl.classList.add("active");
+  });
+
+  sendFormEl.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var text = contentEl.value.trim();
+    if (!text || !ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    appendMessage("user", text);
+    ws.send(JSON.stringify({ content: text }));
+    contentEl.value = "";
+    setLocked(true);
+    loadConversationList();
+  });
+
+  loadAgents();
+  loadConversationList();
+})();
+</script>
+</body>
+</html>

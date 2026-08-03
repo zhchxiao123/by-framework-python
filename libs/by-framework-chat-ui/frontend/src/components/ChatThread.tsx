@@ -94,7 +94,7 @@ export function ChatThread({
   connectionStatus?: ConnectionStatus;
 }) {
   return (
-    <ThreadPrimitive.Root className="flex h-full flex-col">
+    <ThreadPrimitive.Root className="flex h-full min-h-0 flex-col">
       {connectionStatus === "reconnecting" && (
         <div className="flex items-center gap-2 bg-amber-50 px-4 py-2 text-sm text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">
           <span aria-hidden>⟳</span>

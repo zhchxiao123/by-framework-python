@@ -39,7 +39,7 @@ function Chat({ conversation }: { conversation: OpenConversation }) {
   const connectionStatus = useConnectionStatus(socket);
 
   return (
-    <div className="mx-auto flex h-full w-full max-w-3xl min-w-0 flex-1 flex-col">
+    <div className="mx-auto flex h-full min-h-0 w-full max-w-3xl min-w-0 flex-1 flex-col">
       <div className="flex items-center gap-2 border-b border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-900">
         <Avatar role="assistant" />
         <div>
@@ -108,7 +108,7 @@ export function App() {
         onNewConversation={goToPicker}
         refreshKey={sidebarRefreshKey}
       />
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {error !== null && (
           <div className="p-4">
             <ErrorNotice message={error} />

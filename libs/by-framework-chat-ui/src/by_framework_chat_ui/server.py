@@ -35,6 +35,12 @@ AGENT_UNAVAILABLE_MESSAGE = "该助手当前不可用"
 CONVERSATION_LOCKED_MESSAGE = "请等待当前回复完成"
 STATIC_PACKAGE = "by_framework_chat_ui.static"
 TITLE_MAX_LENGTH = 20
+STATIC_CONTENT_TYPES = {
+    ".html": "text/html",
+    ".css": "text/css",
+    ".js": "application/javascript",
+    ".svg": "image/svg+xml",
+}
 
 GATEWAY_CLIENT_KEY: web.AppKey[GatewayClient] = web.AppKey(
     "gateway_client", GatewayClient
@@ -77,7 +83,23 @@ def create_app(
     app.router.add_post("/api/conversations/{session_id}/messages", _send_message)
     app.router.add_get("/ws/conversations/{session_id}", _ws_conversation)
     app.router.add_get("/", _index)
+    app.router.add_get("/{asset_name}", _static_asset)
     return app
+
+
+def read_static_asset(asset_name: str) -> tuple[bytes, str]:
+    """Read a packaged static asset (the Vite-built frontend) by name."""
+    normalized = asset_name.strip("/") or "index.html"
+    if "/" in normalized or normalized.startswith("."):
+        raise FileNotFoundError(normalized)
+
+    resource = files(STATIC_PACKAGE).joinpath(normalized)
+    if not resource.is_file():
+        raise FileNotFoundError(normalized)
+
+    suffix = "." + normalized.rsplit(".", 1)[-1] if "." in normalized else ""
+    content_type = STATIC_CONTENT_TYPES.get(suffix, "application/octet-stream")
+    return resource.read_bytes(), content_type
 
 
 async def _resolve_conversation(request: web.Request, session_id: str):
@@ -101,8 +123,17 @@ async def _resolve_conversation(request: web.Request, session_id: str):
 
 
 async def _index(request: web.Request) -> web.Response:
-    body = files(STATIC_PACKAGE).joinpath("index.html").read_bytes()
-    return web.Response(body=body, content_type="text/html")
+    body, content_type = read_static_asset("index.html")
+    return web.Response(body=body, content_type=content_type)
+
+
+async def _static_asset(request: web.Request) -> web.Response:
+    asset_name = request.match_info["asset_name"]
+    try:
+        body, content_type = read_static_asset(asset_name)
+    except FileNotFoundError:
+        return web.json_response({"error": "not found"}, status=404)
+    return web.Response(body=body, content_type=content_type)
 
 
 async def _list_agents(request: web.Request) -> web.Response:

@@ -467,3 +467,24 @@ async def test_rehydrated_waiting_user_conversation_replies_with_resume():
     last_call = redis.xadd.call_args_list[-1]
     payload = jsonlib.loads(last_call.args[1]["data"])
     assert payload["action_type"] == ActionType.RESUME.value
+
+
+@pytest.mark.asyncio
+async def test_serves_built_frontend_assets_by_extension():
+    app, redis, registry = _make_app()
+    async with TestClient(TestServer(app)) as tc:
+        js_resp = await tc.get("/app.js")
+        assert js_resp.status == 200
+        assert js_resp.content_type == "application/javascript"
+
+        css_resp = await tc.get("/styles.css")
+        assert css_resp.status == 200
+        assert css_resp.content_type == "text/css"
+
+
+@pytest.mark.asyncio
+async def test_unknown_static_asset_is_404():
+    app, redis, registry = _make_app()
+    async with TestClient(TestServer(app)) as tc:
+        resp = await tc.get("/does-not-exist.js")
+        assert resp.status == 404

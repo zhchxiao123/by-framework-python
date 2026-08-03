@@ -61,6 +61,54 @@ def _ask_user_form(prompt):
     )
 
 
+def _tool_call(call_id, name, arguments):
+    return DataMessage(
+        trace_id="t1",
+        session_id="s1",
+        event_type="answerDelta",
+        data={
+            "contentType": "1002",
+            "choices": [
+                {
+                    "delta": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments},
+                            }
+                        ],
+                    }
+                }
+            ],
+        },
+    )
+
+
+def _tool_response(call_id, content, tool_name=""):
+    return DataMessage(
+        trace_id="t1",
+        session_id="s1",
+        event_type="answerDelta",
+        data={
+            "contentType": "1002",
+            "choices": [
+                {
+                    "delta": {
+                        "role": "tool",
+                        "content": None,
+                        "tool_responses": [
+                            {"tool_call_id": call_id, "content": content}
+                        ],
+                    }
+                }
+            ],
+        },
+        metadata={"tool_name": tool_name} if tool_name else {},
+    )
+
+
 def _xread_batch(*messages, start_id=1):
     entries = [
         (f"{i}-0", message.to_redis_payload())
@@ -106,6 +154,90 @@ async def test_streams_chunks_then_final_then_turn_complete():
         {"type": "final", "content": "hello"},
         {"type": "turn_complete"},
         {"type": "unlocked"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streams_tool_call_and_tool_result_events():
+    batch = _xread_batch(
+        _tool_call("call_1", "calculate", '{"expression": "1+1"}'),
+        _tool_response("call_1", "2", tool_name="calculate"),
+        _final_answer("the answer is 2"),
+        _stream_end(),
+    )
+    app, redis = _make_app(xread_batches=[batch])
+
+    async with TestClient(TestServer(app)) as tc:
+        create_resp = await tc.post(
+            "/api/conversations", json={"agent_type": "planner"}
+        )
+        session_id = (await create_resp.json())["session_id"]
+
+        async with tc.ws_connect(f"/ws/conversations/{session_id}") as ws:
+            await ws.send_json({"content": "what is 1+1?"})
+            messages = [await ws.receive_json() for _ in range(6)]
+
+    assert messages == [
+        {"type": "locked"},
+        {
+            "type": "tool_call",
+            "call_id": "call_1",
+            "name": "calculate",
+            "arguments": '{"expression": "1+1"}',
+        },
+        {
+            "type": "tool_result",
+            "call_id": "call_1",
+            "content": "2",
+            "tool_name": "calculate",
+        },
+        {"type": "final", "content": "the answer is 2"},
+        {"type": "turn_complete"},
+        {"type": "unlocked"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ws_persists_the_turns_tool_calls_on_the_assistant_message():
+    batch = _xread_batch(
+        _tool_call("call_1", "calculate", '{"expression": "1+1"}'),
+        _tool_response("call_1", "2", tool_name="calculate"),
+        _final_answer("the answer is 2"),
+        _stream_end(),
+    )
+    redis, registry = make_fake_redis_and_registry(xread_batches=[batch])
+    client = make_gateway_client(redis, registry)
+    history_store, conn = make_fake_history_store()
+    app = create_app(
+        gateway_client=client, registry=registry, history_store=history_store
+    )
+
+    async with TestClient(TestServer(app)) as tc:
+        create_resp = await tc.post(
+            "/api/conversations", json={"agent_type": "planner"}
+        )
+        session_id = (await create_resp.json())["session_id"]
+
+        async with tc.ws_connect(f"/ws/conversations/{session_id}") as ws:
+            await ws.send_json({"content": "what is 1+1?"})
+            for _ in range(6):
+                await ws.receive_json()
+
+    insert_calls = [
+        call
+        for call in conn.execute.await_args_list
+        if "INSERT INTO chat_ui_messages" in call.args[0]
+    ]
+    assistant_insert = insert_calls[-1]
+    assert assistant_insert.args[1:4] == (session_id, "assistant", "the answer is 2")
+    persisted_tool_calls = json.loads(assistant_insert.args[5])
+    assert persisted_tool_calls == [
+        {
+            "call_id": "call_1",
+            "name": "calculate",
+            "arguments": '{"expression": "1+1"}',
+            "result": "2",
+        }
     ]
 
 

@@ -1,4 +1,5 @@
 # pylint: disable=C0114,C0116
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -58,7 +59,7 @@ async def test_save_message_inserts_and_touches_conversation():
     insert_call = conn.execute.await_args_list[-2]
     touch_call = conn.execute.await_args_list[-1]
     assert "INSERT INTO chat_ui_messages" in insert_call.args[0]
-    assert insert_call.args[1:] == ("s1", "user", "hi there", False)
+    assert insert_call.args[1:] == ("s1", "user", "hi there", False, "[]")
     assert "UPDATE chat_ui_conversations" in touch_call.args[0]
     assert touch_call.args[1] == "s1"
 
@@ -70,7 +71,28 @@ async def test_save_message_marks_ask_user_messages():
     await store.save_message("s1", "assistant", "What is your name?", is_ask_user=True)
 
     insert_call = conn.execute.await_args_list[-2]
-    assert insert_call.args[1:] == ("s1", "assistant", "What is your name?", True)
+    assert insert_call.args[1:] == ("s1", "assistant", "What is your name?", True, "[]")
+
+
+@pytest.mark.asyncio
+async def test_save_message_persists_tool_calls_as_json():
+    store, conn = _make_store()
+    tool_calls = [
+        {"call_id": "call_1", "name": "calculate", "arguments": "{}", "result": "2"}
+    ]
+
+    await store.save_message(
+        "s1", "assistant", "the answer is 2", tool_calls=tool_calls
+    )
+
+    insert_call = conn.execute.await_args_list[-2]
+    assert insert_call.args[1:] == (
+        "s1",
+        "assistant",
+        "the answer is 2",
+        False,
+        json.dumps(tool_calls),
+    )
 
 
 @pytest.mark.asyncio
@@ -114,12 +136,14 @@ async def test_get_messages_returns_rows_in_order():
             "content": "hi",
             "is_ask_user": False,
             "created_at": "2026-08-03T10:24:00+00:00",
+            "tool_calls": "[]",
         },
         {
             "role": "assistant",
             "content": "hello",
             "is_ask_user": False,
             "created_at": "2026-08-03T10:24:05+00:00",
+            "tool_calls": "[]",
         },
     ]
 
@@ -131,14 +155,59 @@ async def test_get_messages_returns_rows_in_order():
             "content": "hi",
             "is_ask_user": False,
             "created_at": "2026-08-03T10:24:00+00:00",
+            "tool_calls": [],
         },
         {
             "role": "assistant",
             "content": "hello",
             "is_ask_user": False,
             "created_at": "2026-08-03T10:24:05+00:00",
+            "tool_calls": [],
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_get_messages_parses_tool_calls_json_string():
+    store, conn = _make_store()
+    tool_calls = [
+        {"call_id": "call_1", "name": "calculate", "arguments": "{}", "result": "2"}
+    ]
+    conn.fetch.return_value = [
+        {
+            "role": "assistant",
+            "content": "the answer is 2",
+            "is_ask_user": False,
+            "created_at": "2026-08-03T10:24:00+00:00",
+            "tool_calls": json.dumps(tool_calls),
+        },
+    ]
+
+    result = await store.get_messages("s1")
+
+    assert result[0]["tool_calls"] == tool_calls
+
+
+@pytest.mark.asyncio
+async def test_get_messages_accepts_already_decoded_tool_calls():
+    # A fake connection double (like this test's own) may hand back a native
+    # Python list rather than the JSON-string shape a real asyncpg
+    # connection returns for a JSONB column without a registered codec.
+    store, conn = _make_store()
+    tool_calls = [{"call_id": "call_1", "name": "calculate", "arguments": "{}"}]
+    conn.fetch.return_value = [
+        {
+            "role": "assistant",
+            "content": "the answer is 2",
+            "is_ask_user": False,
+            "created_at": "2026-08-03T10:24:00+00:00",
+            "tool_calls": tool_calls,
+        },
+    ]
+
+    result = await store.get_messages("s1")
+
+    assert result[0]["tool_calls"] == tool_calls
 
 
 @pytest.mark.asyncio

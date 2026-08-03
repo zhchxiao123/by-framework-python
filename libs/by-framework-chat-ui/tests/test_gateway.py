@@ -15,7 +15,14 @@ from by_framework_chat_ui.gateway import (
     dispatch_and_await,
     stream_turn,
 )
-from by_framework_chat_ui.protocol import (AnswerChunk, AskUser, FinalAnswer, StreamEnd)
+from by_framework_chat_ui.protocol import (
+    AnswerChunk,
+    AskUser,
+    FinalAnswer,
+    StreamEnd,
+    ToolCall,
+    ToolResult,
+)
 
 
 def _answer_delta(content):
@@ -24,6 +31,54 @@ def _answer_delta(content):
         session_id="s1",
         event_type="answerDelta",
         data={"contentType": "1002", "choices": [{"delta": {"content": content}}]},
+    )
+
+
+def _tool_call(call_id, name, arguments):
+    return DataMessage(
+        trace_id="t1",
+        session_id="s1",
+        event_type="answerDelta",
+        data={
+            "contentType": "1002",
+            "choices": [
+                {
+                    "delta": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments},
+                            }
+                        ],
+                    }
+                }
+            ],
+        },
+    )
+
+
+def _tool_response(call_id, content, tool_name=""):
+    return DataMessage(
+        trace_id="t1",
+        session_id="s1",
+        event_type="answerDelta",
+        data={
+            "contentType": "1002",
+            "choices": [
+                {
+                    "delta": {
+                        "role": "tool",
+                        "content": None,
+                        "tool_responses": [
+                            {"tool_call_id": call_id, "content": content}
+                        ],
+                    }
+                }
+            ],
+        },
+        metadata={"tool_name": tool_name} if tool_name else {},
     )
 
 
@@ -237,6 +292,85 @@ async def test_stream_turn_yields_chunks_then_final_answer_then_stops():
         FinalAnswer(content="hello"),
         StreamEnd(),
     ]
+
+
+@pytest.mark.asyncio
+async def test_stream_turn_yields_tool_call_and_tool_result_before_final_answer():
+    client, redis = _make_client(
+        xread_batches=[
+            _xread_batch(
+                _tool_call("call_1", "calculate", '{"expression": "1+1"}'),
+                _tool_response("call_1", "2", tool_name="calculate"),
+            ),
+            _xread_batch(_final_answer("the answer is 2"), _stream_end(), start_id=3),
+        ]
+    )
+
+    events = [
+        event
+        async for event in stream_turn(
+            client, session_id="s1", agent_type="planner", content="hi"
+        )
+    ]
+
+    assert events == [
+        ToolCall(call_id="call_1", name="calculate", arguments='{"expression": "1+1"}'),
+        ToolResult(call_id="call_1", content="2", tool_name="calculate"),
+        FinalAnswer(content="the answer is 2"),
+        StreamEnd(),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_and_await_ignores_tool_events_but_still_resolves():
+    client, redis = _make_client(
+        xread_batches=[
+            _xread_batch(
+                _tool_call("call_1", "calculate", "{}"),
+                _tool_response("call_1", "2"),
+                _final_answer("the answer is 2"),
+                _stream_end(),
+            )
+        ]
+    )
+
+    result = await dispatch_and_await(
+        client, session_id="s1", agent_type="planner", content="hi"
+    )
+
+    assert result.status == "completed"
+    assert result.content == "the answer is 2"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_and_await_collects_tool_calls_into_turn_result():
+    client, redis = _make_client(
+        xread_batches=[
+            _xread_batch(
+                _tool_call("call_1", "calculate", '{"expression": "1+1"}'),
+                _tool_response("call_1", "2", tool_name="calculate"),
+                _final_answer("the answer is 2"),
+                _stream_end(),
+            )
+        ]
+    )
+
+    result = await dispatch_and_await(
+        client, session_id="s1", agent_type="planner", content="hi"
+    )
+
+    assert result == TurnResult(
+        status="completed",
+        content="the answer is 2",
+        tool_calls=[
+            {
+                "call_id": "call_1",
+                "name": "calculate",
+                "arguments": '{"expression": "1+1"}',
+                "result": "2",
+            }
+        ],
+    )
 
 
 @pytest.mark.asyncio

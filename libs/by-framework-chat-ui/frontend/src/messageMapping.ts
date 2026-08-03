@@ -1,5 +1,6 @@
 import type { ThreadMessage } from "@assistant-ui/react";
 import type { HistoryMessage } from "./api";
+import { parseToolArgs } from "./chatAdapter";
 
 /**
  * Convert a persisted history message (from `GET /api/conversations/{id}`)
@@ -15,7 +16,15 @@ export function historyMessageToThreadMessage(
 ): ThreadMessage {
   const id = `history-${index}`;
   const createdAt = new Date(record.created_at);
-  const content = [{ type: "text" as const, text: record.content }];
+  const toolCallParts = (record.tool_calls ?? []).map((tc) => ({
+    type: "tool-call" as const,
+    toolCallId: tc.call_id,
+    toolName: tc.name,
+    argsText: tc.arguments,
+    args: parseToolArgs(tc.arguments),
+    result: tc.result ?? undefined,
+  }));
+  const content = [...toolCallParts, { type: "text" as const, text: record.content }];
 
   if (record.role === "user") {
     return {

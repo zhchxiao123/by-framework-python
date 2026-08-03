@@ -24,11 +24,19 @@ from .conversations import WAITING_USER, Conversation, ConversationStore
 from .gateway import (
     AgentUnavailableError,
     TurnTimeoutError,
+    accumulate_tool_event,
     dispatch_and_await,
     stream_turn,
 )
 from .hub import WebSocketHub
-from .protocol import AnswerChunk, AskUser, FinalAnswer, StreamEnd
+from .protocol import (
+    AnswerChunk,
+    AskUser,
+    FinalAnswer,
+    StreamEnd,
+    ToolCall,
+    ToolResult,
+)
 from .storage import ChatHistoryStore
 
 AGENT_UNAVAILABLE_MESSAGE = "该助手当前不可用"
@@ -246,6 +254,7 @@ async def _send_message(request: web.Request) -> web.Response:
             "assistant",
             result.content,
             is_ask_user=(result.status == "waiting_user"),
+            tool_calls=result.tool_calls,
         )
         return web.json_response(
             {"role": "assistant", "status": result.status, "content": result.content}
@@ -264,6 +273,20 @@ def _ws_event_payload(event) -> dict:
         return {"type": "ask_user", "prompt": event.prompt}
     if isinstance(event, StreamEnd):
         return {"type": "turn_complete"}
+    if isinstance(event, ToolCall):
+        return {
+            "type": "tool_call",
+            "call_id": event.call_id,
+            "name": event.name,
+            "arguments": event.arguments,
+        }
+    if isinstance(event, ToolResult):
+        return {
+            "type": "tool_result",
+            "call_id": event.call_id,
+            "content": event.content,
+            "tool_name": event.tool_name,
+        }
     return {"type": "other"}
 
 
@@ -316,6 +339,7 @@ async def _ws_conversation(request: web.Request) -> web.WebSocketResponse:
                     turn_status = "completed"
                     accumulated_text = ""
                     ask_user_prompt = ""
+                    tool_calls: dict[str, dict] = {}
                     async for event in stream_turn(
                         request.app[GATEWAY_CLIENT_KEY],
                         session_id=session_id,
@@ -334,6 +358,8 @@ async def _ws_conversation(request: web.Request) -> web.WebSocketResponse:
                             ask_user_prompt = event.prompt
                         elif isinstance(event, StreamEnd):
                             turn_status = "completed"
+                        elif isinstance(event, (ToolCall, ToolResult)):
+                            accumulate_tool_event(tool_calls, event)
                         try:
                             await ws.send_json(_ws_event_payload(event))
                         except ConnectionResetError:
@@ -351,6 +377,7 @@ async def _ws_conversation(request: web.Request) -> web.WebSocketResponse:
                         "assistant",
                         ask_user_prompt if is_waiting_user else accumulated_text,
                         is_ask_user=is_waiting_user,
+                        tool_calls=list(tool_calls.values()),
                     )
                 except AgentUnavailableError:
                     await ws.send_json(

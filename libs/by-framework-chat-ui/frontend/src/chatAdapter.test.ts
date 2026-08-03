@@ -95,6 +95,44 @@ describe("createWebSocketChatAdapter", () => {
     expect(final.done).toBe(true);
   });
 
+  it("accumulates a tool_call/tool_result pair into a tool-call content part", async () => {
+    const fake = new FakeSocket();
+    fake.open();
+    const socket = createSessionSocket("s1", () => fake as unknown as WebSocket);
+    const adapter = createWebSocketChatAdapter(socket);
+
+    const gen = adapter.run(runOptions("what is 1+1?")) as AsyncGenerator<any>;
+    const runPromise = collectYields(gen, 3);
+    await Promise.resolve();
+    fake.receive({
+      type: "tool_call",
+      call_id: "call_1",
+      name: "calculate",
+      arguments: '{"expression": "1+1"}',
+    });
+    fake.receive({
+      type: "tool_result",
+      call_id: "call_1",
+      content: "2",
+      tool_name: "calculate",
+    });
+    fake.receive({ type: "final", content: "the answer is 2" });
+
+    const results = await runPromise;
+
+    expect(results[results.length - 1]!.content).toEqual([
+      {
+        type: "tool-call",
+        toolCallId: "call_1",
+        toolName: "calculate",
+        argsText: '{"expression": "1+1"}',
+        args: { expression: "1+1" },
+        result: "2",
+      },
+      { type: "text", text: "the answer is 2" },
+    ]);
+  });
+
   it("throws when the server reports an error", async () => {
     const fake = new FakeSocket();
     fake.open();

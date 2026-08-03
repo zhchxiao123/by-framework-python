@@ -53,4 +53,52 @@ describe("applyServerEvent", () => {
 
     expect(state).toEqual(beforeLock);
   });
+
+  it("adds a tool_call event as a pending tool call entry", () => {
+    let state = initialTurnState();
+    state = applyServerEvent(state, {
+      type: "tool_call",
+      call_id: "call_1",
+      name: "calculate",
+      arguments: '{"expression": "1+1"}',
+    });
+
+    expect(state.toolCalls).toEqual([
+      { toolCallId: "call_1", toolName: "calculate", argsText: '{"expression": "1+1"}' },
+    ]);
+  });
+
+  it("fills in the result of the matching tool call on tool_result", () => {
+    let state = initialTurnState();
+    state = applyServerEvent(state, {
+      type: "tool_call",
+      call_id: "call_1",
+      name: "calculate",
+      arguments: "{}",
+    });
+    state = applyServerEvent(state, {
+      type: "tool_result",
+      call_id: "call_1",
+      content: "2",
+      tool_name: "calculate",
+    });
+
+    expect(state.toolCalls).toEqual([
+      { toolCallId: "call_1", toolName: "calculate", argsText: "{}", result: "2" },
+    ]);
+  });
+
+  it("renders a placeholder tool call for a tool_result with no matching prior tool_call", () => {
+    let state = initialTurnState();
+    state = applyServerEvent(state, {
+      type: "tool_result",
+      call_id: "call_orphan",
+      content: "2",
+      tool_name: "calculate",
+    });
+
+    expect(state.toolCalls).toEqual([
+      { toolCallId: "call_orphan", toolName: "calculate", argsText: "", result: "2" },
+    ]);
+  });
 });

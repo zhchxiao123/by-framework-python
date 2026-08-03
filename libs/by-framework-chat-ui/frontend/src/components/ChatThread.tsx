@@ -7,6 +7,7 @@ import {
 import { Avatar } from "./Avatar";
 import { ErrorNotice } from "./ErrorNotice";
 import { MarkdownText } from "./MarkdownText";
+import { ToolCallCard } from "./ToolCallCard";
 import type { ConnectionStatus } from "../chatSocket";
 import { formatTime } from "../formatTime";
 
@@ -79,7 +80,9 @@ function AssistantMessage() {
               : "rounded-2xl rounded-tl-sm bg-white px-3.5 py-2 text-slate-800 shadow-sm ring-1 ring-slate-200 dark:bg-slate-800 dark:text-slate-100 dark:ring-slate-700"
           }
         >
-          <MessagePrimitive.Parts components={{ Text: MarkdownText }} />
+          <MessagePrimitive.Parts
+            components={{ Text: MarkdownText, tools: { Fallback: ToolCallCard } }}
+          />
         </div>
         <Timestamp />
       </div>

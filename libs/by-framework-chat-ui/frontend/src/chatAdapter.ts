@@ -3,6 +3,7 @@ import type {
   ChatModelRunResult,
   ThreadMessage,
 } from "@assistant-ui/react";
+import type { ReadonlyJSONObject } from "assistant-stream/utils";
 import { applyServerEvent, initialTurnState, type TurnState } from "./protocol";
 import type { SessionSocket } from "./chatSocket";
 
@@ -15,9 +16,28 @@ function extractLatestUserText(messages: readonly ThreadMessage[]): string {
     .join("");
 }
 
+export function parseToolArgs(argsText: string): ReadonlyJSONObject {
+  try {
+    const parsed: unknown = JSON.parse(argsText);
+    return parsed !== null && typeof parsed === "object"
+      ? (parsed as ReadonlyJSONObject)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 function toRunResult(state: TurnState): ChatModelRunResult {
+  const toolCallParts = state.toolCalls.map((tc) => ({
+    type: "tool-call" as const,
+    toolCallId: tc.toolCallId,
+    toolName: tc.toolName,
+    argsText: tc.argsText,
+    args: parseToolArgs(tc.argsText),
+    result: tc.result,
+  }));
   return {
-    content: [{ type: "text", text: state.accumulated }],
+    content: [...toolCallParts, { type: "text", text: state.accumulated }],
     metadata: state.isAskUser ? { custom: { askUser: true } } : undefined,
   };
 }

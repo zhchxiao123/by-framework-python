@@ -51,6 +51,54 @@ def _ask_user_form(prompt):
     )
 
 
+def _tool_call(call_id, name, arguments):
+    return DataMessage(
+        trace_id="t1",
+        session_id="s1",
+        event_type="answerDelta",
+        data={
+            "contentType": "1002",
+            "choices": [
+                {
+                    "delta": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments},
+                            }
+                        ],
+                    }
+                }
+            ],
+        },
+    )
+
+
+def _tool_response(call_id, content, tool_name=""):
+    return DataMessage(
+        trace_id="t1",
+        session_id="s1",
+        event_type="answerDelta",
+        data={
+            "contentType": "1002",
+            "choices": [
+                {
+                    "delta": {
+                        "role": "tool",
+                        "content": None,
+                        "tool_responses": [
+                            {"tool_call_id": call_id, "content": content}
+                        ],
+                    }
+                }
+            ],
+        },
+        metadata={"tool_name": tool_name} if tool_name else {},
+    )
+
+
 def _xread_batch(*messages, start_id=1):
     entries = [
         (f"{i}-0", message.to_redis_payload())
@@ -263,8 +311,63 @@ async def test_send_message_persists_user_and_assistant_messages():
         if "INSERT INTO chat_ui_messages" in call.args[0]
     ]
     assert len(insert_calls) == 2
-    assert insert_calls[0].args[1:] == (session_id, "user", "hi", False)
-    assert insert_calls[1].args[1:] == (session_id, "assistant", "hi there", False)
+    assert insert_calls[0].args[1:] == (session_id, "user", "hi", False, "[]")
+    assert insert_calls[1].args[1:] == (
+        session_id,
+        "assistant",
+        "hi there",
+        False,
+        "[]",
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_message_persists_tool_calls_on_the_assistant_message():
+    import json
+
+    redis, registry = make_fake_redis_and_registry(
+        xread_batches=[
+            _xread_batch(
+                _tool_call("call_1", "calculate", '{"expression": "1+1"}'),
+                _tool_response("call_1", "2", tool_name="calculate"),
+                _final_answer("the answer is 2"),
+                _stream_end(),
+            )
+        ]
+    )
+    client = make_gateway_client(redis, registry)
+    history_store, conn = make_fake_history_store()
+    app = create_app(
+        gateway_client=client, registry=registry, history_store=history_store
+    )
+
+    async with TestClient(TestServer(app)) as tc:
+        create_resp = await tc.post(
+            "/api/conversations", json={"agent_type": "planner"}
+        )
+        session_id = (await create_resp.json())["session_id"]
+        send_resp = await tc.post(
+            f"/api/conversations/{session_id}/messages",
+            json={"content": "what is 1+1?"},
+        )
+        assert send_resp.status == 200
+
+    insert_calls = [
+        call
+        for call in conn.execute.await_args_list
+        if "INSERT INTO chat_ui_messages" in call.args[0]
+    ]
+    assistant_insert = insert_calls[-1]
+    assert assistant_insert.args[1:4] == (session_id, "assistant", "the answer is 2")
+    persisted_tool_calls = json.loads(assistant_insert.args[5])
+    assert persisted_tool_calls == [
+        {
+            "call_id": "call_1",
+            "name": "calculate",
+            "arguments": '{"expression": "1+1"}',
+            "result": "2",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -288,12 +391,14 @@ async def test_get_conversation_returns_persisted_history():
                 "content": "hi",
                 "is_ask_user": False,
                 "created_at": "2026-08-03T10:24:00+00:00",
+                "tool_calls": "[]",
             },
             {
                 "role": "assistant",
                 "content": "hello",
                 "is_ask_user": False,
                 "created_at": "2026-08-03T10:24:05+00:00",
+                "tool_calls": "[]",
             },
         ]
 
@@ -309,12 +414,14 @@ async def test_get_conversation_returns_persisted_history():
             "content": "hi",
             "is_ask_user": False,
             "created_at": "2026-08-03T10:24:00+00:00",
+            "tool_calls": [],
         },
         {
             "role": "assistant",
             "content": "hello",
             "is_ask_user": False,
             "created_at": "2026-08-03T10:24:05+00:00",
+            "tool_calls": [],
         },
     ]
 
@@ -339,6 +446,7 @@ async def test_get_conversation_rehydrates_from_postgres_after_restart():
             "content": "hi",
             "is_ask_user": False,
             "created_at": "2026-08-03T10:24:00+00:00",
+            "tool_calls": "[]",
         }
     ]
     app = create_app(
@@ -359,6 +467,7 @@ async def test_get_conversation_rehydrates_from_postgres_after_restart():
                 "content": "hi",
                 "is_ask_user": False,
                 "created_at": "2026-08-03T10:24:00+00:00",
+                "tool_calls": [],
             }
         ],
     }

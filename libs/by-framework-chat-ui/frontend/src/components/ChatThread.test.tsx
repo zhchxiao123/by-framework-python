@@ -24,6 +24,7 @@ function Fixture({
         content: "你好",
         is_ask_user: false,
         created_at: "2026-08-03T09:05:00+00:00",
+        tool_calls: [],
       },
       0,
     ),
@@ -33,6 +34,7 @@ function Fixture({
         content: "好的,请问查询哪个城市?",
         is_ask_user: false,
         created_at: "2026-08-03T09:06:00+00:00",
+        tool_calls: [],
       },
       1,
     ),
@@ -42,6 +44,7 @@ function Fixture({
         content: "可以告诉我你的名字吗?",
         is_ask_user: true,
         created_at: "2026-08-03T09:07:00+00:00",
+        tool_calls: [],
       },
       2,
     ),
@@ -65,6 +68,38 @@ function MarkdownFixture() {
         content: "**加粗文本**\n\n- 第一项\n- 第二项\n\n`inline code`",
         is_ask_user: false,
         created_at: "2026-08-03T09:06:00+00:00",
+        tool_calls: [],
+      },
+      0,
+    ),
+  ];
+  const runtime = useLocalRuntime(adapter, { initialMessages });
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <ChatThread locked={false} />
+    </AssistantRuntimeProvider>
+  );
+}
+
+function ToolCallFixture() {
+  const socket = createSessionSocket("s1", () => new FakeSocket() as unknown as WebSocket);
+  const adapter = createWebSocketChatAdapter(socket);
+  const initialMessages = [
+    historyMessageToThreadMessage(
+      {
+        role: "assistant",
+        content: "the answer is 2",
+        is_ask_user: false,
+        created_at: "2026-08-03T09:06:00+00:00",
+        tool_calls: [
+          {
+            call_id: "call_1",
+            name: "calculate",
+            arguments: '{"expression": "1+1"}',
+            result: "2",
+          },
+        ],
       },
       0,
     ),
@@ -135,6 +170,15 @@ describe("ChatThread markdown rendering", () => {
     expect(container.querySelectorAll("li")).toHaveLength(2);
     expect(screen.getByText("inline code").tagName).toBe("CODE");
     expect(screen.queryByText(/\*\*加粗文本\*\*/)).not.toBeInTheDocument();
+  });
+});
+
+describe("ChatThread tool-call rendering", () => {
+  it("renders a ToolCallCard alongside the assistant's reply text", () => {
+    render(<ToolCallFixture />);
+
+    expect(screen.getByText(/调用了 calculate/)).toBeInTheDocument();
+    expect(screen.getByText("the answer is 2")).toBeInTheDocument();
   });
 });
 

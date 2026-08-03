@@ -9,6 +9,7 @@ describe("historyMessageToThreadMessage", () => {
       content: "hi",
       is_ask_user: false,
       created_at: "2026-08-03T09:05:00+00:00",
+      tool_calls: [],
     };
 
     const message = historyMessageToThreadMessage(record, 0);
@@ -23,6 +24,7 @@ describe("historyMessageToThreadMessage", () => {
       content: "hello there",
       is_ask_user: false,
       created_at: "2026-08-03T09:05:00+00:00",
+      tool_calls: [],
     };
 
     const message = historyMessageToThreadMessage(record, 1);
@@ -39,6 +41,7 @@ describe("historyMessageToThreadMessage", () => {
       content: "What is your name?",
       is_ask_user: true,
       created_at: "2026-08-03T09:05:00+00:00",
+      tool_calls: [],
     };
 
     const message = historyMessageToThreadMessage(record, 1);
@@ -50,11 +53,23 @@ describe("historyMessageToThreadMessage", () => {
 
   it("assigns each message a unique, stable id derived from its index", () => {
     const a = historyMessageToThreadMessage(
-      { role: "user", content: "a", is_ask_user: false, created_at: "2026-08-03T09:05:00+00:00" },
+      {
+        role: "user",
+        content: "a",
+        is_ask_user: false,
+        created_at: "2026-08-03T09:05:00+00:00",
+        tool_calls: [],
+      },
       0,
     );
     const b = historyMessageToThreadMessage(
-      { role: "user", content: "b", is_ask_user: false, created_at: "2026-08-03T09:05:00+00:00" },
+      {
+        role: "user",
+        content: "b",
+        is_ask_user: false,
+        created_at: "2026-08-03T09:05:00+00:00",
+        tool_calls: [],
+      },
       1,
     );
 
@@ -67,10 +82,42 @@ describe("historyMessageToThreadMessage", () => {
       content: "hi",
       is_ask_user: false,
       created_at: "2026-08-03T09:05:00+00:00",
+      tool_calls: [],
     };
 
     const message = historyMessageToThreadMessage(record, 0);
 
     expect(message.createdAt).toEqual(new Date("2026-08-03T09:05:00+00:00"));
+  });
+
+  it("maps persisted tool_calls into tool-call content parts before the text part", () => {
+    const record: HistoryMessage = {
+      role: "assistant",
+      content: "the answer is 2",
+      is_ask_user: false,
+      created_at: "2026-08-03T09:05:00+00:00",
+      tool_calls: [
+        {
+          call_id: "call_1",
+          name: "calculate",
+          arguments: '{"expression": "1+1"}',
+          result: "2",
+        },
+      ],
+    };
+
+    const message = historyMessageToThreadMessage(record, 0);
+
+    expect(message.content).toEqual([
+      {
+        type: "tool-call",
+        toolCallId: "call_1",
+        toolName: "calculate",
+        argsText: '{"expression": "1+1"}',
+        args: { expression: "1+1" },
+        result: "2",
+      },
+      { type: "text", text: "the answer is 2" },
+    ]);
   });
 });

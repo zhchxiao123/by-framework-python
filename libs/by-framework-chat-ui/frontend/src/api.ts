@@ -5,11 +5,19 @@ export interface ConversationSummary {
   last_active_at: string | null;
 }
 
+export interface HistoryToolCall {
+  call_id: string;
+  name: string;
+  arguments: string;
+  result: string | null;
+}
+
 export interface HistoryMessage {
   role: string;
   content: string;
   is_ask_user: boolean;
   created_at: string;
+  tool_calls: HistoryToolCall[];
 }
 
 export interface ConversationDetail {

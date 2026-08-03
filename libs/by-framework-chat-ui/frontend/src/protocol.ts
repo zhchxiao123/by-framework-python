@@ -14,17 +14,27 @@ export type ServerEvent =
   | { type: "locked" }
   | { type: "unlocked" }
   | { type: "error"; message: string }
+  | { type: "tool_call"; call_id: string; name: string; arguments: string }
+  | { type: "tool_result"; call_id: string; content: string; tool_name: string }
   | { type: "other" };
+
+export interface ToolCallState {
+  toolCallId: string;
+  toolName: string;
+  argsText: string;
+  result?: string;
+}
 
 export interface TurnState {
   accumulated: string;
   isAskUser: boolean;
   done: boolean;
   error: string | null;
+  toolCalls: ToolCallState[];
 }
 
 export function initialTurnState(): TurnState {
-  return { accumulated: "", isAskUser: false, done: false, error: null };
+  return { accumulated: "", isAskUser: false, done: false, error: null, toolCalls: [] };
 }
 
 export function isLockEvent(
@@ -45,6 +55,46 @@ export function applyServerEvent(state: TurnState, event: ServerEvent): TurnStat
       return { ...state, done: true };
     case "error":
       return { ...state, error: event.message, done: true };
+    case "tool_call":
+      return {
+        ...state,
+        toolCalls: [
+          ...state.toolCalls,
+          {
+            toolCallId: event.call_id,
+            toolName: event.name,
+            argsText: event.arguments,
+          },
+        ],
+      };
+    case "tool_result": {
+      const hasMatch = state.toolCalls.some((tc) => tc.toolCallId === event.call_id);
+      if (!hasMatch) {
+        // No matching prior ToolCall this turn — not expected by the wire
+        // protocol, but not enforced either; render a placeholder rather
+        // than silently dropping the result.
+        return {
+          ...state,
+          toolCalls: [
+            ...state.toolCalls,
+            {
+              toolCallId: event.call_id,
+              toolName: event.tool_name || "tool",
+              argsText: "",
+              result: event.content,
+            },
+          ],
+        };
+      }
+      return {
+        ...state,
+        toolCalls: state.toolCalls.map((tc) =>
+          tc.toolCallId === event.call_id
+            ? { ...tc, result: event.content, toolName: tc.toolName || event.tool_name }
+            : tc,
+        ),
+      };
+    }
     case "locked":
     case "unlocked":
     case "other":

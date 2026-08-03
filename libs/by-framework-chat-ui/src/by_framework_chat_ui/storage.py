@@ -14,6 +14,7 @@ raises instead of degrading quietly.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from typing import Any, Awaitable, Callable, Optional
 
@@ -44,6 +45,7 @@ class ChatHistoryStore:
         role VARCHAR(16) NOT NULL,
         content TEXT NOT NULL,
         is_ask_user BOOLEAN NOT NULL DEFAULT FALSE,
+        tool_calls JSONB NOT NULL DEFAULT '[]'::jsonb,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """
@@ -75,8 +77,8 @@ class ChatHistoryStore:
     """
 
     _INSERT_MESSAGE_SQL = """
-    INSERT INTO chat_ui_messages (session_id, role, content, is_ask_user)
-    VALUES ($1, $2, $3, $4);
+    INSERT INTO chat_ui_messages (session_id, role, content, is_ask_user, tool_calls)
+    VALUES ($1, $2, $3, $4, $5);
     """
 
     _TOUCH_CONVERSATION_SQL = """
@@ -91,7 +93,7 @@ class ChatHistoryStore:
     """
 
     _SELECT_MESSAGES_SQL = """
-    SELECT role, content, is_ask_user, created_at
+    SELECT role, content, is_ask_user, tool_calls, created_at
     FROM chat_ui_messages
     WHERE session_id = $1
     ORDER BY created_at, id;
@@ -190,13 +192,31 @@ class ChatHistoryStore:
             await conn.execute(self._SET_INITIAL_TITLE_SQL, session_id, title)
 
     async def save_message(
-        self, session_id: str, role: str, content: str, *, is_ask_user: bool = False
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        *,
+        is_ask_user: bool = False,
+        tool_calls: Optional[list[dict[str, Any]]] = None,
     ) -> None:
-        """Persist one message and bump the Conversation's last-active time."""
+        """Persist one message and bump the Conversation's last-active time.
+
+        `tool_calls` is one entry per tool the assistant invoked during this
+        turn (`{"call_id", "name", "arguments", "result"}`), collected by
+        `gateway.dispatch_and_await`/`stream_turn`'s callers — a turn's tool
+        calls are stored on its one assistant message row, not as separate
+        rows, so history rehydration stays a single per-turn record.
+        """
         await self._ensure_schema()
         async with self.pool.acquire() as conn:
             await conn.execute(
-                self._INSERT_MESSAGE_SQL, session_id, role, content, is_ask_user
+                self._INSERT_MESSAGE_SQL,
+                session_id,
+                role,
+                content,
+                is_ask_user,
+                json.dumps(tool_calls or []),
             )
             await conn.execute(self._TOUCH_CONVERSATION_SQL, session_id)
 
@@ -255,6 +275,7 @@ class ChatHistoryStore:
                 "role": r["role"],
                 "content": r["content"],
                 "is_ask_user": r["is_ask_user"],
+                "tool_calls": _decode_tool_calls(r["tool_calls"]),
                 "created_at": _isoformat(r["created_at"]),
             }
             for r in rows
@@ -279,3 +300,16 @@ class ChatHistoryStore:
 def _isoformat(value: Any) -> Any:
     isoformat = getattr(value, "isoformat", None)
     return isoformat() if isoformat is not None else value
+
+
+def _decode_tool_calls(value: Any) -> list[dict[str, Any]]:
+    """Parse a JSONB `tool_calls` column value.
+
+    A real asyncpg connection (no custom type codec registered, matching
+    `by-framework-history-postgres`'s convention) returns a JSONB column as
+    a raw JSON string; a fake connection double in tests may hand back an
+    already-decoded Python list.
+    """
+    if isinstance(value, str):
+        return json.loads(value)
+    return value or []

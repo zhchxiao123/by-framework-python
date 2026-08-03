@@ -1,7 +1,7 @@
 # pylint: disable=C0114,C0116
 from by_framework.core.protocol.action_type import ActionType
 
-from by_framework_chat_ui.conversations import IDLE, WAITING_USER, ConversationStore
+from by_framework_chat_ui.conversations import (IDLE, WAITING_USER, ConversationStore)
 
 
 def test_new_conversation_starts_idle_and_uses_ask_agent():
@@ -83,3 +83,27 @@ def test_rehydrate_preserves_a_persisted_waiting_user_state():
 
     assert conversation.turn_state == WAITING_USER
     assert conversation.next_action_type() == ActionType.RESUME.value
+
+
+def test_new_conversation_has_no_last_message_id():
+    conversation = ConversationStore().create("planner")
+
+    assert conversation.last_message_id == ""
+
+
+def test_generate_message_id_returns_a_non_empty_unique_id():
+    conversation = ConversationStore().create("planner")
+
+    first = conversation.generate_message_id()
+    second = conversation.generate_message_id()
+
+    assert first
+    assert first != second
+
+
+def test_rehydrate_preserves_a_persisted_last_message_id():
+    conversation = ConversationStore().rehydrate(
+        "s1", "planner", turn_state=WAITING_USER, last_message_id="msg-abc123"
+    )
+
+    assert conversation.last_message_id == "msg-abc123"

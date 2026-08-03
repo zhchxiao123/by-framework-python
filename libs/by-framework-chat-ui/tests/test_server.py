@@ -2,13 +2,13 @@
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from by_framework.core.protocol.data_message import DataMessage
-
-from by_framework_chat_ui.server import create_app
 from support import (
     make_fake_history_store,
     make_fake_redis_and_registry,
     make_gateway_client,
 )
+
+from by_framework_chat_ui.server import create_app
 
 
 def _final_answer(content):
@@ -208,9 +208,15 @@ async def test_reply_after_ask_user_is_sent_as_resume_not_ask_agent():
             f"/api/conversations/{session_id}/messages", json={"content": "Alice"}
         )
 
+    first_call = redis.xadd.call_args_list[-2]
+    first_payload = jsonlib.loads(first_call.args[1]["data"])
     second_call = redis.xadd.call_args_list[-1]
     payload = jsonlib.loads(second_call.args[1]["data"])
     assert payload["action_type"] == ActionType.RESUME.value
+    # Regression: RESUME must reuse the ASK_AGENT dispatch's message_id so
+    # GatewayClient.send_message can look the suspended execution back up
+    # (get_execution_by_message_id) — a fresh id silently orphans it.
+    assert payload["header"]["message_id"] == first_payload["header"]["message_id"]
 
 
 @pytest.mark.asyncio
@@ -325,6 +331,7 @@ async def test_get_conversation_rehydrates_from_postgres_after_restart():
         "agent_type": "planner",
         "title": "Hello",
         "turn_state": "IDLE",
+        "last_message_id": "",
     }
     conn.fetch.return_value = [
         {
@@ -487,6 +494,7 @@ async def test_rehydrated_waiting_user_conversation_replies_with_resume():
         "agent_type": "planner",
         "title": "What is your name?",
         "turn_state": "WAITING_USER",
+        "last_message_id": "msg-original123",
     }
     app = create_app(
         gateway_client=client, registry=registry, history_store=history_store
@@ -501,6 +509,11 @@ async def test_rehydrated_waiting_user_conversation_replies_with_resume():
     last_call = redis.xadd.call_args_list[-1]
     payload = jsonlib.loads(last_call.args[1]["data"])
     assert payload["action_type"] == ActionType.RESUME.value
+    # Regression: the RESUME must reuse the message_id persisted before the
+    # restart, not a freshly-generated one — GatewayClient.send_message uses
+    # this id to look the suspended execution back up
+    # (get_execution_by_message_id); a fresh id would silently orphan it.
+    assert payload["header"]["message_id"] == "msg-original123"
 
 
 @pytest.mark.asyncio

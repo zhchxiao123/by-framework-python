@@ -20,7 +20,7 @@ from by_framework.common.redis_client import init_redis
 from by_framework.core.registry import WorkerRegistry
 
 from .agents import list_online_agent_types
-from .conversations import ConversationStore
+from .conversations import WAITING_USER, Conversation, ConversationStore
 from .gateway import (
     AgentUnavailableError,
     TurnTimeoutError,
@@ -118,8 +118,34 @@ async def _resolve_conversation(request: web.Request, session_id: str):
     if record is None:
         return None
     return conversations.rehydrate(
-        session_id, record["agent_type"], turn_state=record["turn_state"]
+        session_id,
+        record["agent_type"],
+        turn_state=record["turn_state"],
+        last_message_id=record["last_message_id"],
     )
+
+
+async def _resolve_message_id(
+    conversation: Conversation, history_store: ChatHistoryStore
+) -> tuple[str, bool]:
+    """Return `(message_id, is_resume)` for the turn about to be dispatched.
+
+    `GatewayClient.send_message` reuses a RESUME's `message_id` to look the
+    suspended execution back up (`get_execution_by_message_id`); passing a
+    freshly-generated one — which is what happens if the caller never
+    threads one through explicitly — silently mints a new orphaned
+    execution instead of resuming the suspended one. A new `message_id` is
+    only minted (and persisted, so a later restart-then-RESUME can still
+    find it via `_resolve_conversation`'s rehydrate) when this isn't a
+    resume of a still-open `ask_user` wait.
+    """
+    if conversation.turn_state == WAITING_USER and conversation.last_message_id:
+        return conversation.last_message_id, True
+
+    message_id = conversation.generate_message_id()
+    conversation.last_message_id = message_id
+    await history_store.set_last_message_id(conversation.session_id, message_id)
+    return message_id, False
 
 
 async def _index(request: web.Request) -> web.Response:
@@ -199,6 +225,7 @@ async def _send_message(request: web.Request) -> web.Response:
         await history_store.save_message(session_id, "user", content)
         await history_store.set_initial_title(session_id, content[:TITLE_MAX_LENGTH])
 
+        message_id, is_resume = await _resolve_message_id(conversation, history_store)
         try:
             result = await dispatch_and_await(
                 request.app[GATEWAY_CLIENT_KEY],
@@ -206,6 +233,8 @@ async def _send_message(request: web.Request) -> web.Response:
                 agent_type=conversation.agent_type,
                 content=content,
                 action_type=conversation.next_action_type(),
+                message_id=message_id,
+                parent_message_id=message_id if is_resume else "",
             )
         except AgentUnavailableError:
             return web.json_response({"error": AGENT_UNAVAILABLE_MESSAGE}, status=409)
@@ -280,6 +309,9 @@ async def _ws_conversation(request: web.Request) -> web.WebSocketResponse:
                     session_id, content[:TITLE_MAX_LENGTH]
                 )
 
+                message_id, is_resume = await _resolve_message_id(
+                    conversation, history_store
+                )
                 try:
                     turn_status = "completed"
                     accumulated_text = ""
@@ -290,6 +322,8 @@ async def _ws_conversation(request: web.Request) -> web.WebSocketResponse:
                         agent_type=conversation.agent_type,
                         content=content,
                         action_type=conversation.next_action_type(),
+                        message_id=message_id,
+                        parent_message_id=message_id if is_resume else "",
                     ):
                         if isinstance(event, AnswerChunk):
                             accumulated_text += event.content

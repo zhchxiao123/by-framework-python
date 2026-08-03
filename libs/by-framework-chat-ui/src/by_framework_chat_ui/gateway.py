@@ -74,6 +74,8 @@ async def _dispatch(
     agent_type: str,
     content: str,
     action_type: str,
+    message_id: str = "",
+    parent_message_id: str = "",
 ) -> None:
     try:
         response = await client.send_message(
@@ -81,6 +83,8 @@ async def _dispatch(
             session_id=session_id,
             content=content,
             action_type=action_type,
+            message_id=message_id or None,
+            parent_message_id=parent_message_id,
         )
     except ValueError as exc:
         raise AgentUnavailableError(agent_type) from exc
@@ -97,6 +101,8 @@ async def stream_turn(
     content: str,
     action_type: str = ActionType.ASK_AGENT.value,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    message_id: str = "",
+    parent_message_id: str = "",
 ) -> AsyncIterator[ParsedEvent]:
     """Dispatch one turn and yield its events as they arrive on the data stream.
 
@@ -104,6 +110,12 @@ async def stream_turn(
     yielded — both are terminal for a turn, per the framework's contract that
     `APP_STREAM_RESPONSE` is withheld exactly when the task suspended on
     `ask_user`. Raises `TurnTimeoutError` if neither arrives in time.
+
+    `message_id`/`parent_message_id` must be the caller's own
+    `Conversation.last_message_id` (generated once per `ASK_AGENT`, reused
+    unchanged for the matching `RESUME`) — see
+    `Conversation.generate_message_id`'s docstring for why leaving these
+    blank on a RESUME orphans the suspended execution.
     """
     current_id = await _tail_stream_id(client, session_id)
     await _dispatch(
@@ -112,6 +124,8 @@ async def stream_turn(
         agent_type=agent_type,
         content=content,
         action_type=action_type,
+        message_id=message_id,
+        parent_message_id=parent_message_id,
     )
 
     loop = asyncio.get_running_loop()
@@ -151,6 +165,8 @@ async def dispatch_and_await(
     content: str,
     action_type: str = ActionType.ASK_AGENT.value,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    message_id: str = "",
+    parent_message_id: str = "",
 ) -> TurnResult:
     """Dispatch one turn and block until it completes or asks the user something."""
     final_text = ""
@@ -161,6 +177,8 @@ async def dispatch_and_await(
         content=content,
         action_type=action_type,
         timeout_seconds=timeout_seconds,
+        message_id=message_id,
+        parent_message_id=parent_message_id,
     ):
         if isinstance(event, FinalAnswer):
             final_text = event.content

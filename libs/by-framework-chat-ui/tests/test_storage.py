@@ -91,6 +91,7 @@ async def test_get_conversation_returns_agent_type_and_title():
         "agent_type": "planner",
         "title": "Hello",
         "turn_state": "IDLE",
+        "last_message_id": "",
     }
 
     result = await store.get_conversation("s1")
@@ -100,6 +101,7 @@ async def test_get_conversation_returns_agent_type_and_title():
         "agent_type": "planner",
         "title": "Hello",
         "turn_state": "IDLE",
+        "last_message_id": "",
     }
 
 
@@ -183,6 +185,7 @@ async def test_get_conversation_includes_turn_state():
         "agent_type": "planner",
         "title": "Hello",
         "turn_state": "WAITING_USER",
+        "last_message_id": "",
     }
 
     result = await store.get_conversation("s1")
@@ -192,4 +195,33 @@ async def test_get_conversation_includes_turn_state():
         "agent_type": "planner",
         "title": "Hello",
         "turn_state": "WAITING_USER",
+        "last_message_id": "",
     }
+
+
+@pytest.mark.asyncio
+async def test_set_last_message_id_updates_conversation():
+    store, conn = _make_store()
+
+    await store.set_last_message_id("s1", "msg-abc123")
+
+    update_call = conn.execute.await_args_list[-1]
+    assert "UPDATE chat_ui_conversations" in update_call.args[0]
+    assert "last_message_id" in update_call.args[0]
+    assert update_call.args[1:] == ("s1", "msg-abc123")
+
+
+@pytest.mark.asyncio
+async def test_get_conversation_includes_last_message_id():
+    store, conn = _make_store()
+    conn.fetchrow.return_value = {
+        "session_id": "s1",
+        "agent_type": "planner",
+        "title": "Hello",
+        "turn_state": "WAITING_USER",
+        "last_message_id": "msg-abc123",
+    }
+
+    result = await store.get_conversation("s1")
+
+    assert result["last_message_id"] == "msg-abc123"

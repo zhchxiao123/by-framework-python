@@ -5,13 +5,13 @@ import json
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from by_framework.core.protocol.data_message import DataMessage
-
-from by_framework_chat_ui.server import create_app
 from support import (
     make_fake_history_store,
     make_fake_redis_and_registry,
     make_gateway_client,
 )
+
+from by_framework_chat_ui.server import create_app
 
 
 def _answer_delta(content):
@@ -172,9 +172,15 @@ async def test_ws_reply_after_ask_user_uses_resume():
                 {"type": "unlocked"},
             ]
 
+    first_call = redis.xadd.call_args_list[-2]
+    first_payload = json.loads(first_call.args[1]["data"])
     second_call = redis.xadd.call_args_list[-1]
     payload = json.loads(second_call.args[1]["data"])
     assert payload["action_type"] == ActionType.RESUME.value
+    # Regression: RESUME must reuse the ASK_AGENT dispatch's message_id so
+    # GatewayClient.send_message can look the suspended execution back up
+    # (get_execution_by_message_id) — a fresh id silently orphans it.
+    assert payload["header"]["message_id"] == first_payload["header"]["message_id"]
 
 
 @pytest.mark.asyncio

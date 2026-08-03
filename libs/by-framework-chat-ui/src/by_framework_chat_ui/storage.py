@@ -31,6 +31,7 @@ class ChatHistoryStore:
         agent_type VARCHAR(128) NOT NULL,
         title TEXT NOT NULL DEFAULT '',
         turn_state VARCHAR(16) NOT NULL DEFAULT 'IDLE',
+        last_message_id VARCHAR(64) NOT NULL DEFAULT '',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         last_active_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -68,6 +69,11 @@ class ChatHistoryStore:
     WHERE session_id = $1;
     """
 
+    _SET_LAST_MESSAGE_ID_SQL = """
+    UPDATE chat_ui_conversations SET last_message_id = $2
+    WHERE session_id = $1;
+    """
+
     _INSERT_MESSAGE_SQL = """
     INSERT INTO chat_ui_messages (session_id, role, content, is_ask_user)
     VALUES ($1, $2, $3, $4);
@@ -79,7 +85,7 @@ class ChatHistoryStore:
     """
 
     _SELECT_CONVERSATION_SQL = """
-    SELECT session_id, agent_type, title, turn_state
+    SELECT session_id, agent_type, title, turn_state, last_message_id
     FROM chat_ui_conversations
     WHERE session_id = $1;
     """
@@ -207,8 +213,25 @@ class ChatHistoryStore:
         async with self.pool.acquire() as conn:
             await conn.execute(self._SET_TURN_STATE_SQL, session_id, turn_state)
 
+    async def set_last_message_id(self, session_id: str, last_message_id: str) -> None:
+        """Persist the `message_id` the current/most-recent turn dispatched with.
+
+        Without this, a service restart mid-`WAITING_USER` would rehydrate
+        the Conversation with an empty `last_message_id`, so the next reply
+        would be sent as a RESUME under a freshly-generated `message_id`
+        that `get_execution_by_message_id` can't find — orphaning the
+        suspended execution the same way an `ASK_AGENT`-instead-of-`RESUME`
+        mistake would (see `set_turn_state`'s docstring).
+        """
+        await self._ensure_schema()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                self._SET_LAST_MESSAGE_ID_SQL, session_id, last_message_id
+            )
+
     async def get_conversation(self, session_id: str) -> Optional[dict[str, Any]]:
-        """Return `{session_id, agent_type, title, turn_state}`, or None."""
+        """Return `{session_id, agent_type, title, turn_state,
+        last_message_id}`, or None."""
         await self._ensure_schema()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(self._SELECT_CONVERSATION_SQL, session_id)
@@ -219,6 +242,7 @@ class ChatHistoryStore:
             "agent_type": row["agent_type"],
             "title": row["title"],
             "turn_state": row["turn_state"],
+            "last_message_id": row["last_message_id"],
         }
 
     async def get_messages(self, session_id: str) -> list[dict[str, Any]]:

@@ -15,7 +15,7 @@ from by_framework_chat_ui.gateway import (
     dispatch_and_await,
     stream_turn,
 )
-from by_framework_chat_ui.protocol import AnswerChunk, AskUser, FinalAnswer, StreamEnd
+from by_framework_chat_ui.protocol import (AnswerChunk, AskUser, FinalAnswer, StreamEnd)
 
 
 def _answer_delta(content):
@@ -145,6 +145,51 @@ async def test_sends_with_the_given_action_type():
     args, kwargs = redis.xadd.call_args
     payload = json.loads(args[1]["data"])
     assert payload["action_type"] == ActionType.RESUME.value
+
+
+@pytest.mark.asyncio
+async def test_dispatch_and_await_passes_through_message_id_and_parent_message_id():
+    client, redis = _make_client(
+        xread_batches=[_xread_batch(_final_answer("ok"), _stream_end())]
+    )
+
+    await dispatch_and_await(
+        client,
+        session_id="s1",
+        agent_type="planner",
+        content="Alice",
+        action_type=ActionType.RESUME.value,
+        message_id="msg-fixed123",
+        parent_message_id="msg-fixed123",
+    )
+
+    args, kwargs = redis.xadd.call_args
+    payload = json.loads(args[1]["data"])
+    assert payload["header"]["message_id"] == "msg-fixed123"
+    assert payload["header"]["parent_message_id"] == "msg-fixed123"
+
+
+@pytest.mark.asyncio
+async def test_stream_turn_passes_through_message_id():
+    client, redis = _make_client(
+        xread_batches=[_xread_batch(_final_answer("ok"), _stream_end())]
+    )
+
+    events = [
+        event
+        async for event in stream_turn(
+            client,
+            session_id="s1",
+            agent_type="planner",
+            content="hi",
+            message_id="msg-fixed456",
+        )
+    ]
+    del events
+
+    args, kwargs = redis.xadd.call_args
+    payload = json.loads(args[1]["data"])
+    assert payload["header"]["message_id"] == "msg-fixed456"
 
 
 @pytest.mark.asyncio

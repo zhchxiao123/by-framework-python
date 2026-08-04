@@ -55,6 +55,22 @@ class ChatHistoryStore:
     ON chat_ui_messages (session_id, created_at, id);
     """
 
+    # `CREATE TABLE IF NOT EXISTS` is a no-op against a table that already
+    # exists from an earlier deployment — a column added after the initial
+    # schema never gets created on an upgrade, and the first query
+    # referencing it fails with `asyncpg.exceptions.UndefinedColumnError`.
+    # One `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` per column introduced
+    # after the tables above were first shipped; a no-op on a fresh install
+    # (the column already exists from `CREATE TABLE`) and a migration on
+    # upgrade. Append here, never edit the `CREATE TABLE` statements above,
+    # when a future column is added.
+    _MIGRATIONS_SQL = (
+        "ALTER TABLE chat_ui_conversations "
+        "ADD COLUMN IF NOT EXISTS last_message_id VARCHAR(64) NOT NULL DEFAULT '';",
+        "ALTER TABLE chat_ui_messages "
+        "ADD COLUMN IF NOT EXISTS tool_calls JSONB NOT NULL DEFAULT '[]'::jsonb;",
+    )
+
     _INSERT_CONVERSATION_SQL = """
     INSERT INTO chat_ui_conversations (session_id, agent_type)
     VALUES ($1, $2)
@@ -173,6 +189,8 @@ class ChatHistoryStore:
                 await conn.execute(self._CREATE_CONVERSATIONS_SQL)
                 await conn.execute(self._CREATE_MESSAGES_SQL)
                 await conn.execute(self._CREATE_MESSAGES_INDEX_SQL)
+                for migration_sql in self._MIGRATIONS_SQL:
+                    await conn.execute(migration_sql)
             self._schema_ready = True
 
     async def create_conversation(self, session_id: str, agent_type: str) -> None:

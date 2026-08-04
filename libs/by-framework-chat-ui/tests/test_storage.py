@@ -39,6 +39,34 @@ async def test_create_conversation_inserts_with_empty_title():
 
 
 @pytest.mark.asyncio
+async def test_ensure_schema_migrates_columns_added_after_the_initial_schema():
+    # Regression: CREATE TABLE IF NOT EXISTS is a no-op against a table that
+    # already exists from an older deployment — a column added after the
+    # initial schema (tool_calls, last_message_id) never gets created on an
+    # upgrade, and the first INSERT/SELECT referencing it fails with
+    # asyncpg.exceptions.UndefinedColumnError. _ensure_schema must also run
+    # ALTER TABLE ... ADD COLUMN IF NOT EXISTS for every column introduced
+    # after the initial CREATE TABLE, so upgrades don't break.
+    store, conn = _make_store()
+
+    await store.create_conversation("s1", "planner")
+
+    statements = [call.args[0] for call in conn.execute.await_args_list]
+    assert any(
+        "ALTER TABLE chat_ui_conversations" in sql
+        and "last_message_id" in sql
+        and "ADD COLUMN IF NOT EXISTS" in sql
+        for sql in statements
+    )
+    assert any(
+        "ALTER TABLE chat_ui_messages" in sql
+        and "tool_calls" in sql
+        and "ADD COLUMN IF NOT EXISTS" in sql
+        for sql in statements
+    )
+
+
+@pytest.mark.asyncio
 async def test_set_initial_title_only_fills_a_blank_title():
     store, conn = _make_store()
 

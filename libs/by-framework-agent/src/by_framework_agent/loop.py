@@ -125,6 +125,12 @@ class HarnessLoop:
                 local_calls = [
                     tc for tc in turn.tool_calls if tc not in sub_agent_calls
                 ]
+                if local_calls:
+                    await context.emit_chunk(
+                        StreamChunkEvent(
+                            tool_calls=_local_calls_wire_shape(local_calls)
+                        )
+                    )
                 tool_results = (
                     await self._execute_tool_calls(context, local_calls, tool_specs)
                     if local_calls
@@ -491,13 +497,18 @@ class HarnessLoop:
         tool_specs: dict[str, ToolSpec],
     ) -> dict[str, Any]:
         if call.parse_error:
-            return _tool_error_message(
-                call, f"Invalid JSON arguments: {call.parse_error}"
+            return await self._emit_tool_result(
+                context,
+                _tool_error_message(
+                    call, f"Invalid JSON arguments: {call.parse_error}"
+                ),
             )
 
         spec = tool_specs.get(call.name)
         if spec is None:
-            return _tool_error_message(call, f"Unknown tool: {call.name!r}")
+            return await self._emit_tool_result(
+                context, _tool_error_message(call, f"Unknown tool: {call.name!r}")
+            )
 
         try:
             await self._fire_callbacks(
@@ -505,7 +516,9 @@ class HarnessLoop:
             )
             result = await spec.handler(context, call.arguments)
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            return _tool_error_message(call, str(exc))
+            return await self._emit_tool_result(
+                context, _tool_error_message(call, str(exc))
+            )
 
         content = (
             result
@@ -517,12 +530,42 @@ class HarnessLoop:
             context,
             {"tool_call": call, "result": content},
         )
-        return {
-            "role": "tool",
-            "tool_call_id": call.id,
-            "name": call.name,
-            "content": content,
-        }
+        return await self._emit_tool_result(
+            context,
+            {
+                "role": "tool",
+                "tool_call_id": call.id,
+                "name": call.name,
+                "content": content,
+            },
+        )
+
+    async def _emit_tool_result(
+        self, context: AgentContext, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Emit one tool's result to the data stream as soon as it's ready.
+
+        Emitted per-call (not batched behind `asyncio.gather` in
+        `_execute_tool_calls`) so a fast tool's result reaches the UI
+        without waiting for a slower parallel tool call to finish. Covers
+        every `_execute_one_tool_call` exit path — success, invalid
+        arguments, unknown tool, and handler exception all share this one
+        `{"role","tool_call_id","name","content"}` shape (the error paths
+        via `_tool_error_message`), so the result is never silently
+        skipped just because the tool failed.
+        """
+        await context.emit_chunk(
+            StreamChunkEvent(
+                tool_responses=[
+                    {
+                        "tool_call_id": result["tool_call_id"],
+                        "content": result["content"],
+                    }
+                ],
+                metadata={"tool_name": result["name"]},
+            )
+        )
+        return result
 
     async def _persist_assistant_tool_call_turn(
         self,
@@ -697,6 +740,27 @@ def _finalize_tool_calls(
             )
         )
     return resolved
+
+
+def _local_calls_wire_shape(calls: list[_ResolvedToolCall]) -> list[dict[str, Any]]:
+    """`StreamChunkEvent.tool_calls` entries for a turn's finalized local calls.
+
+    Uses `raw_arguments` (the complete concatenated JSON string), not the
+    parsed `arguments` dict — chat-ui's `protocol.py` reads
+    `function.arguments` as a string. Only ever called with `_finalize_tool_calls`'s
+    output, never with raw `chunk.tool_call_deltas`: those are OpenAI/litellm-style
+    streaming fragments (partial id/name/arguments per chunk, joined by
+    `_merge_tool_call_deltas`), and emitting a fragment as-is would send
+    chat-ui unparseable partial JSON.
+    """
+    return [
+        {
+            "id": call.id,
+            "type": "function",
+            "function": {"name": call.name, "arguments": call.raw_arguments},
+        }
+        for call in calls
+    ]
 
 
 def _tool_error_message(call: _ResolvedToolCall, error: str) -> dict[str, Any]:

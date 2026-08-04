@@ -1,9 +1,10 @@
 # pylint: disable=redefined-outer-name
 import asyncio
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from by_framework import RunningExecution
 from by_framework.core.extensions.agent_config import CallbackType
 from by_framework.core.runtime.history.history_manager import HistoryManager
 from test_native_agent_worker import (_agent_config, _ChatWorker, _command, _registry)
@@ -11,6 +12,52 @@ from test_native_agent_worker import (_agent_config, _ChatWorker, _command, _reg
 from by_framework_agent.model_client import ModelChunk
 from by_framework_agent.testing import StubModelClient
 from by_framework_agent.tool_spec import ToolSpec
+
+
+def _execution(execution_id: str, worker_id: str) -> RunningExecution:
+    return RunningExecution(
+        execution_id=execution_id,
+        message_id="msg-1",
+        session_id="session-1",
+        worker_id=worker_id,
+        task=AsyncMock(),
+        cancel_event=AsyncMock(),
+    )
+
+
+def _emitted_data_messages(mock_redis) -> list[dict]:
+    """Parse every `DataMessage` the harness wrote to the data stream.
+
+    `AgentContext.emit_chunk` -> `GatewayDataEmitter.emit_event` writes via
+    `redis.pipeline().xadd(stream_name, msg.to_redis_payload(), ...)`; the
+    mock_redis fixture's `pipeline()` always returns the same MagicMock, so
+    its `xadd.call_args_list` accumulates every emitted message for the
+    whole test.
+    """
+    calls = mock_redis.pipeline.return_value.xadd.call_args_list
+    return [json.loads(call.args[1]["data"]) for call in calls]
+
+
+def _tool_call_deltas(messages: list[dict]) -> list[dict]:
+    return [
+        tc
+        for msg in messages
+        for tc in (
+            msg["data"].get("choices", [{}])[0].get("delta", {}).get("tool_calls") or []
+        )
+    ]
+
+
+def _tool_response_deltas(messages: list[dict]) -> list[tuple[dict, dict]]:
+    """Return (tool_response, message_metadata) pairs."""
+    return [
+        (tr, msg["metadata"])
+        for msg in messages
+        for tr in (
+            msg["data"].get("choices", [{}])[0].get("delta", {}).get("tool_responses")
+            or []
+        )
+    ]
 
 
 def _weather_tool_spec(handler) -> ToolSpec:
@@ -99,6 +146,279 @@ async def test_tool_call_then_final_answer(mock_redis, workspace_manager):
 
 
 @pytest.mark.asyncio
+async def test_tool_call_emits_a_tool_calls_chunk_to_the_data_stream(
+    mock_redis, workspace_manager
+):
+    async def get_weather(context, arguments):  # pylint: disable=unused-argument
+        return {"tempC": 21}
+
+    tool = _weather_tool_spec(get_weather)
+    model_client = StubModelClient(
+        turns=[
+            [
+                ModelChunk(
+                    tool_call_deltas=[
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "SF"}',
+                            },
+                        }
+                    ],
+                    is_final=True,
+                    finish_reason="tool_calls",
+                ),
+            ],
+            [ModelChunk(content="It's 21C.", is_final=True, finish_reason="stop")],
+        ]
+    )
+    worker = _ChatWorker(
+        worker_id="agent-1",
+        redis_client=mock_redis,
+        registry=MagicMock(),
+        workspace_manager=workspace_manager,
+        plugin_registry=_registry([_agent_config(tools={"get_weather": tool})]),
+        model_client=model_client,
+    )
+
+    await worker._handle_message(_command())  # pylint: disable=protected-access
+
+    tool_calls = _tool_call_deltas(_emitted_data_messages(mock_redis))
+    assert tool_calls == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city": "SF"}'},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_result_emits_a_tool_responses_chunk_with_tool_name_metadata(
+    mock_redis, workspace_manager
+):
+    async def get_weather(context, arguments):  # pylint: disable=unused-argument
+        return {"tempC": 21}
+
+    tool = _weather_tool_spec(get_weather)
+    model_client = StubModelClient(
+        turns=[
+            [
+                ModelChunk(
+                    tool_call_deltas=[
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "SF"}',
+                            },
+                        }
+                    ],
+                    is_final=True,
+                    finish_reason="tool_calls",
+                ),
+            ],
+            [ModelChunk(content="It's 21C.", is_final=True, finish_reason="stop")],
+        ]
+    )
+    worker = _ChatWorker(
+        worker_id="agent-1",
+        redis_client=mock_redis,
+        registry=MagicMock(),
+        workspace_manager=workspace_manager,
+        plugin_registry=_registry([_agent_config(tools={"get_weather": tool})]),
+        model_client=model_client,
+    )
+
+    await worker._handle_message(_command())  # pylint: disable=protected-access
+
+    tool_responses = _tool_response_deltas(_emitted_data_messages(mock_redis))
+    assert len(tool_responses) == 1
+    response, metadata = tool_responses[0]
+    assert response == {"tool_call_id": "call_1", "content": json.dumps({"tempC": 21})}
+    assert metadata["tool_name"] == "get_weather"
+
+
+@pytest.mark.asyncio
+async def test_tool_error_still_emits_a_tool_responses_chunk(
+    mock_redis, workspace_manager
+):
+    async def broken_handler(context, arguments):  # pylint: disable=unused-argument
+        raise RuntimeError("boom")
+
+    tool = ToolSpec(name="broken_tool", handler=broken_handler)
+    model_client = StubModelClient(
+        turns=[
+            [
+                ModelChunk(
+                    tool_call_deltas=[
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {"name": "broken_tool", "arguments": "{}"},
+                        }
+                    ],
+                    is_final=True,
+                    finish_reason="tool_calls",
+                ),
+            ],
+            [ModelChunk(content="recovered", is_final=True, finish_reason="stop")],
+        ]
+    )
+    worker = _ChatWorker(
+        worker_id="agent-1",
+        redis_client=mock_redis,
+        registry=MagicMock(),
+        workspace_manager=workspace_manager,
+        plugin_registry=_registry([_agent_config(tools={"broken_tool": tool})]),
+        model_client=model_client,
+    )
+
+    await worker._handle_message(_command())  # pylint: disable=protected-access
+
+    tool_responses = _tool_response_deltas(_emitted_data_messages(mock_redis))
+    assert len(tool_responses) == 1
+    response, metadata = tool_responses[0]
+    assert response["tool_call_id"] == "call_1"
+    assert "boom" in response["content"]
+    assert metadata["tool_name"] == "broken_tool"
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_still_emits_a_tool_responses_chunk(
+    mock_redis, workspace_manager
+):
+    model_client = StubModelClient(
+        turns=[
+            [
+                ModelChunk(
+                    tool_call_deltas=[
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {"name": "nonexistent_tool", "arguments": "{}"},
+                        }
+                    ],
+                    is_final=True,
+                    finish_reason="tool_calls",
+                ),
+            ],
+            [ModelChunk(content="recovered", is_final=True, finish_reason="stop")],
+        ]
+    )
+    worker = _ChatWorker(
+        worker_id="agent-1",
+        redis_client=mock_redis,
+        registry=MagicMock(),
+        workspace_manager=workspace_manager,
+        plugin_registry=_registry([_agent_config(tools={})]),
+        model_client=model_client,
+    )
+
+    await worker._handle_message(_command())  # pylint: disable=protected-access
+
+    tool_responses = _tool_response_deltas(_emitted_data_messages(mock_redis))
+    assert len(tool_responses) == 1
+    response, metadata = tool_responses[0]
+    assert response["tool_call_id"] == "call_1"
+    assert "Unknown tool" in response["content"]
+    assert metadata["tool_name"] == "nonexistent_tool"
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_arguments_still_emits_a_tool_responses_chunk(
+    mock_redis, workspace_manager
+):
+    async def get_weather(context, arguments):  # pylint: disable=unused-argument
+        raise AssertionError("should never be called with invalid arguments")
+
+    tool = _weather_tool_spec(get_weather)
+    model_client = StubModelClient(
+        turns=[
+            [
+                ModelChunk(
+                    tool_call_deltas=[
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "get_weather",
+                                # Malformed JSON: unclosed brace.
+                                "arguments": '{"city": "SF"',
+                            },
+                        }
+                    ],
+                    is_final=True,
+                    finish_reason="tool_calls",
+                ),
+            ],
+            [ModelChunk(content="recovered", is_final=True, finish_reason="stop")],
+        ]
+    )
+    worker = _ChatWorker(
+        worker_id="agent-1",
+        redis_client=mock_redis,
+        registry=MagicMock(),
+        workspace_manager=workspace_manager,
+        plugin_registry=_registry([_agent_config(tools={"get_weather": tool})]),
+        model_client=model_client,
+    )
+
+    await worker._handle_message(_command())  # pylint: disable=protected-access
+
+    tool_responses = _tool_response_deltas(_emitted_data_messages(mock_redis))
+    assert len(tool_responses) == 1
+    response, metadata = tool_responses[0]
+    assert response["tool_call_id"] == "call_1"
+    assert "Invalid JSON arguments" in response["content"]
+    assert metadata["tool_name"] == "get_weather"
+
+
+@pytest.mark.asyncio
+async def test_ask_user_call_does_not_emit_a_tool_calls_chunk(
+    mock_redis, workspace_manager
+):
+    model_client = StubModelClient(
+        turns=[
+            [
+                ModelChunk(
+                    tool_call_deltas=[
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "ask_user",
+                                "arguments": '{"prompt": "What is your name?"}',
+                            },
+                        }
+                    ],
+                    is_final=True,
+                    finish_reason="tool_calls",
+                ),
+            ],
+        ]
+    )
+    worker = _ChatWorker(
+        worker_id="agent-1",
+        redis_client=mock_redis,
+        registry=None,
+        workspace_manager=workspace_manager,
+        plugin_registry=_registry([_agent_config(tools={})]),
+        model_client=model_client,
+    )
+
+    result = await worker._handle_message(  # pylint: disable=protected-access
+        _command(), execution=_execution("exec-1", "agent-1")
+    )
+
+    assert result.status == "WAITING_USER"
+    assert _tool_call_deltas(_emitted_data_messages(mock_redis)) == []
+
+
+@pytest.mark.asyncio
 async def test_multiple_tool_calls_in_one_turn_run_concurrently(
     mock_redis, workspace_manager
 ):
@@ -154,6 +474,13 @@ async def test_multiple_tool_calls_in_one_turn_run_concurrently(
 
     # If tools ran sequentially, fast_start couldn't happen until slow_end.
     assert order.index("fast_start") < order.index("slow_end")
+
+    # Each tool's result chunk must reach the data stream as soon as that
+    # tool finishes, not batched together after asyncio.gather returns both
+    # — otherwise the fast tool's result would wait on the slow one in the UI.
+    tool_responses = _tool_response_deltas(_emitted_data_messages(mock_redis))
+    response_call_ids = [response["tool_call_id"] for response, _ in tool_responses]
+    assert response_call_ids.index("call_fast") < response_call_ids.index("call_slow")
 
 
 @pytest.mark.asyncio

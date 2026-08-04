@@ -171,6 +171,7 @@ async def test_send_message_returns_full_reply():
             "role": "assistant",
             "status": "completed",
             "content": "hi there",
+            "tool_calls": [],
         }
 
 

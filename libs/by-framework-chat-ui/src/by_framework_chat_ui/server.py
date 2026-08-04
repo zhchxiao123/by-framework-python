@@ -257,7 +257,12 @@ async def _send_message(request: web.Request) -> web.Response:
             tool_calls=result.tool_calls,
         )
         return web.json_response(
-            {"role": "assistant", "status": result.status, "content": result.content}
+            {
+                "role": "assistant",
+                "status": result.status,
+                "content": result.content,
+                "tool_calls": result.tool_calls,
+            }
         )
     finally:
         conversation.unlock()
